@@ -27,8 +27,11 @@ SQL_STAMP_SIDEC = ("UPDATE api_requests SET phase_id=? WHERE id=? AND is_sidecha
 
 def _phase_id_at(db, session_id, ts_e):
     """Phase containing ts_e by EPOCH comparison (ISO strings mix Z and +offset formats
-    and must never be compared lexically — spans store epochs in evidence_json)."""
-    best = None
+    and must never be compared lexically — spans store epochs in evidence_json).
+    A dispatch record can postdate the last main-chain response (the dispatch IS the
+    last event before the agent runs), so with no containing span the nearest
+    preceding phase is the attribution (spec §6: dispatch-phase rule)."""
+    best, best_start = None, None
     for r in db.execute("SELECT id, evidence_json FROM workflow_phases WHERE session_id=?",
                         (session_id,)).fetchall():
         try:
@@ -37,7 +40,9 @@ def _phase_id_at(db, session_id, ts_e):
             continue
         s0, s1 = ev.get("start_epoch"), ev.get("end_epoch")
         if (s0 is None or ts_e >= s0) and (s1 is None or ts_e <= s1):
-            best = r["id"]  # sequential spans: the (last) container wins
+            return r["id"]  # sequential spans: the container wins outright
+        if s0 is not None and ts_e >= s0 and (best_start is None or s0 >= best_start):
+            best, best_start = r["id"], s0
     return best
 
 
@@ -91,8 +96,18 @@ def build_dispatches(db, session_ids=None):
         parent, agent_id, source_file = row["parent_session_id"], row["agent_id"], row["source_file"]
         meta = _meta_for(source_file) if source_file else {}
         tool_use_id = meta.get("toolUseId")
-        parent_file = _parent_main_file(db, parent)
-        dispatch_ts = _find_dispatch_ts(parent_file, tool_use_id, agent_id)
+        # Dispatch candidates: the root session's main transcript PLUS sibling subagent
+        # files — a depth-2 agent's dispatch record lives in its depth-1 parent's file,
+        # not the root main transcript (verified on a real specimen, Phase B gate #4).
+        candidates = [_parent_main_file(db, parent)] + [
+            str(p) for p in _sibling_agent_files(source_file)]
+        dispatch_ts = None
+        for cand in candidates:
+            if not cand:
+                continue
+            dispatch_ts = _find_dispatch_ts(cand, tool_use_id, agent_id)
+            if dispatch_ts:
+                break
         phase_id = None
         if dispatch_ts:
             phase_id = _phase_id_at(db, parent, ts_epoch(dispatch_ts))
@@ -115,6 +130,17 @@ def _parent_main_file(db, parent_session_id):
                      "AND source_file NOT LIKE '%/subagents/%' LIMIT 1",
                      (parent_session_id,)).fetchone()
     return row["source_file"] if row else None
+
+
+def _sibling_agent_files(source_file):
+    if not source_file:
+        return []
+    d = os.path.dirname(source_file)
+    try:
+        return [os.path.join(d, p) for p in os.listdir(d)
+                if p.endswith(".jsonl") and p.startswith("agent-")]
+    except OSError:
+        return []
 
 
 def join_otel_durations(db, session_ids=None, tolerance_s=5.0):

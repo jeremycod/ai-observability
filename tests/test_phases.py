@@ -223,5 +223,46 @@ class TestPhases(PhaseBase):
         self.assertIn("sessB", ids)
 
 
+    def test_real_depth2_specimen(self):
+        """Gate #4: real depth-2 nesting produced in a scratch session (2026-10-25).
+        The inner agent's dispatch record lives in the OUTER agent's transcript, not
+        the root main file — sibling-file resolution must find it. Meta also carries
+        parentAgentId (explicit nesting evidence)."""
+        sid = "168d244b-71e9-476c-a286-76a9830d6543"  # root session id in the fixture
+        db = self.db()
+        recs = chain_session(sid, [
+            ("U1", "root", "2026-10-25T10:40:00Z", "p1",
+             [("A1", "2026-10-25T10:41:00Z", U)]),
+        ])
+        self.seed(db, sid, "main",
+                  [("2026-10-25T10:39:30Z", "investigate-problem", "p1")], recs,
+                  t0="2026-10-25T10:39:00Z")
+        # root main transcript gains the OUTER agent's dispatch (toolUseId call_7c6c…)
+        recs.append({"type": "assistant", "uuid": "DISPATCH-OUTER", "parentUuid": "A1",
+                     "sessionId": sid, "timestamp": "2026-10-25T10:41:30Z",
+                     "isSidechain": False,
+                     "message": {"content": [{"type": "tool_use",
+                                              "id": "call_7c6cd6bec767452fb885a8c7",
+                                              "name": "Agent"}]}})
+        f = self.write_session_transcript(sid, recs)
+        fx = common.FIXTURES / "subagents"
+        ingest_file(db, f)
+        ingest_file(db, fx / "agent-depth2-outer.jsonl")
+        ingest_file(db, fx / "agent-depth2-inner.jsonl")
+        workflow.build(db, [sid])
+        subagents.build_dispatches(db, [sid])
+        rows = {r["agent_id"]: r for r in db.execute(
+            "SELECT * FROM subagent_dispatches WHERE parent_session_id=?", (sid,)).fetchall()}
+        self.assertIn("depth2-outer", rows)   # depth 1 (agent_id from filename)
+        self.assertIn("depth2-inner", rows)   # depth 2
+        for aid in ("depth2-outer", "depth2-inner"):
+            self.assertIsNotNone(rows[aid]["dispatch_ts"],
+                                 "depth-2 dispatch must resolve via sibling files")
+            self.assertIsNotNone(rows[aid]["phase_id"])
+        meta_inner = json.load(open(fx / "agent-depth2-inner.meta.json"))
+        self.assertEqual(meta_inner.get("parentAgentId"), "a21ce94741efccf15")
+        self.assertEqual(meta_inner.get("spawnDepth"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
