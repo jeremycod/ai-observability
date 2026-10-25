@@ -59,8 +59,11 @@ class TestMigrationOnCopy(unittest.TestCase):
             source = "synthetic"
         before = counts(target)
         db = connect(target)
-        applied = migrate(db)
-        self.assertTrue(any(v == 1 for v, _ in applied))
+        migrate(db)
+        # migration 001 present whether this copy was pre-migration (installer case)
+        # or already migrated (live DB is migrated after install — rerun case)
+        n = db.execute("SELECT COUNT(*) c FROM schema_migrations WHERE version=1").fetchone()["c"]
+        self.assertEqual(n, 1)
         # A2: legacy table counts unchanged by an additive migration
         self.assertEqual(counts(target), before)
         # legacy queries (statusline / reports / hooks) must all still execute

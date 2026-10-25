@@ -7,6 +7,7 @@ enqueue), collector v2, doctor v2, ingest, backfill (event-time window), reconci
 import argparse
 import datetime as dt
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -18,11 +19,19 @@ LEGACY_COMMANDS = ("statusline", "env", "backup", "restore", "providers", "skill
                    "models", "jira", "matrix", "sessions", "today", "week", "month")
 
 
+def _legacy_path():
+    # Resolve at call time: CC_USAGE_HOME may differ per process/invocation.
+    home = os.environ.get("CC_USAGE_HOME")
+    if home:
+        return Path(home) / "cc_usage_legacy_v1.py"
+    return LEGACY_MODULE
+
+
 def _run_legacy(args):
-    if not LEGACY_MODULE.exists():
-        raise SystemExit("legacy cc_usage module not found at %s; run install.sh"
-                         % LEGACY_MODULE)
-    spec = importlib.util.spec_from_file_location("cc_usage_legacy_v1", str(LEGACY_MODULE))
+    path = _legacy_path()
+    if not path.exists():
+        raise SystemExit("legacy cc_usage module not found at %s; run install.sh" % path)
+    spec = importlib.util.spec_from_file_location("cc_usage_legacy_v1", str(path))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     sys.argv = ["cc-usage"] + list(args)
@@ -69,25 +78,32 @@ def build_parser():
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = build_parser()
-    args, rest = parser.parse_known_args(argv)
-    cmd = getattr(args, "cmd", None)
-
-    if cmd is None or cmd == "help":
+    # Pre-scan the first positional token BEFORE argparse: legacy commands must reach
+    # the v1 module untouched (argparse would reject them as invalid choices — this was
+    # a live regression caught by the post-install compatibility smoke test).
+    first = next((a for a in argv if not a.startswith("-")), None)
+    if first is None or first == "help":
         return _run_legacy(["help"])
-    if cmd == "env":
+    if first == "env":
         # Launchers call `cc-usage env <launcher> <provider>`; v1 also (re)started its own
         # collector here. Emit the IDENTICAL export lines but ensure the v2 collector.
         from .collector import collector_alive, port_open, start_collector
         if not (collector_alive() and port_open()):
             start_collector()
-        spec = importlib.util.spec_from_file_location("cc_usage_legacy_v1", str(LEGACY_MODULE))
+        path = _legacy_path()
+        spec = importlib.util.spec_from_file_location("cc_usage_legacy_v1", str(path))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        mod.env_lines(rest[0] if rest else "unknown", rest[1] if len(rest) > 1 else "unknown")
+        positional = [a for a in argv if not a.startswith("-")][1:]
+        mod.env_lines(positional[0] if positional else "unknown",
+                      positional[1] if len(positional) > 1 else "unknown")
         return 0
-    if cmd in LEGACY_COMMANDS:
+    if first in LEGACY_COMMANDS:
         return _run_legacy(argv)
+
+    parser = build_parser()
+    args, rest = parser.parse_known_args(argv)
+    cmd = getattr(args, "cmd", None)
 
     if cmd == "hook":
         from .hookspool import hook_command

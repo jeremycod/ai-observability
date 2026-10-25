@@ -84,3 +84,26 @@ class TestConfigSnapshotRedaction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLegacyDelegation(unittest.TestCase):
+    def test_statusline_and_reports_delegate(self):
+        """Regression: argparse must never reject legacy subcommands (live bug 2026-10-25)."""
+        import io
+        import os
+        from contextlib import redirect_stdout
+        from cc_usage.app import main
+        # stub the v1 module inside the isolated CC_USAGE_HOME so delegation is observable
+        stub = os.path.join(os.environ["CC_USAGE_HOME"], "cc_usage_legacy_v1.py")
+        with open(stub, "w") as f:
+            f.write("import sys\n"
+                    "def main():\n"
+                    "    print('LEGACY-OK ' + ' '.join(sys.argv[1:]))\n"
+                    "    return 0\n")
+        for args in (["statusline"], ["today"], ["providers", "--period", "week"]):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(args)
+            self.assertEqual(code, 0, "%s failed" % args)
+            self.assertIn("LEGACY-OK", out.getvalue(), "%s did not delegate to v1" % args)
+            self.assertNotIn("invalid choice", out.getvalue())
