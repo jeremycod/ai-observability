@@ -71,6 +71,11 @@ def build_parser():
     bf.add_argument("--projects-dir", default=str(PROJECTS_DIR))
     rec = sp.add_parser("reconcile", help="recompute a session's totals from raw transcripts")
     rec.add_argument("session")
+    ph = sp.add_parser("phases", help="workflow phase attribution (build/show)")
+    ph.add_argument("action", nargs="?", choices=["build", "show"], default="build")
+    ph.add_argument("session_pos", nargs="?", default=None)
+    ph.add_argument("--session", default=None)
+    ph.add_argument("--lineage", default=None)
     sp.add_parser("spool", help="explicit spool maintenance (`spool prune` removes "
                                 "replayed payloads; never runs automatically)")
     sp.add_parser("db", help="print database path")
@@ -144,6 +149,55 @@ def main(argv=None):
         code = reconcile_session(db, args.session)
         db.close()
         return code
+    if cmd == "phases":
+        from .attribution import subagents, workflow
+        db = connect(DB_PATH, timeout=60)
+        migrate(db)
+        sessions = [args.session] if args.session else None
+        if args.action == "build":
+            n = workflow.build(db, sessions)
+            d = subagents.build_dispatches(db, sessions)
+            j = subagents.join_otel_durations(db, sessions)
+            print("phases: %d spans, %d dispatch stamps, %d measured-duration joins"
+                  % (n, d, j))
+            db.close()
+            return 0
+        # show
+        if args.session is None and getattr(args, "session_pos", None):
+            args.session = args.session_pos
+        if args.lineage:
+            rows = db.execute(
+                "SELECT p.phase, COUNT(r.id) responses, "
+                "SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens+r.cache_creation_tokens) tok "
+                "FROM workflow_phases p JOIN api_requests r ON r.phase_id=p.id "
+                "WHERE p.lineage_id=? GROUP BY p.phase ORDER BY tok DESC", (args.lineage,)).fetchall()
+            print("lineage %s" % args.lineage)
+            for r in rows:
+                print("  %-14s %6s responses  %12s tok" % (r["phase"], r["responses"], r["tok"] or 0))
+            db.close()
+            return 0
+        sid = args.session
+        if not sid:
+            print("usage: cc-usage phases show --session <id> [--lineage <ticket:RUS-xxxx>]")
+            db.close()
+            return 1
+        rows = db.execute("SELECT id, phase, started_at, ended_at, trigger_kind, confidence, basis "
+                          "FROM workflow_phases WHERE session_id=? ORDER BY started_at", (sid,)).fetchall()
+        print("phases for %s (%d spans; durations are a timeline, not disjoint wall-clock)" % (sid, len(rows)))
+        for r in rows:
+            print("  %-16s %s -> %s  [%s/%s] %s"
+                  % (r["phase"], (r["started_at"] or "")[:19], (r["ended_at"] or "")[:19],
+                     r["confidence"], r["basis"], r["trigger_kind"] or ""))
+        tot = db.execute(
+            "SELECT p.phase, COUNT(r.id) n, "
+            "SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens+r.cache_creation_tokens) tok "
+            "FROM api_requests r JOIN workflow_phases p ON p.id=r.phase_id "
+            "WHERE r.session_id=? GROUP BY p.phase ORDER BY tok DESC", (sid,)).fetchall()
+        print("token split:")
+        for t in tot:
+            print("  %-16s %5d responses %14d tok" % (t["phase"], t["n"], t["tok"] or 0))
+        db.close()
+        return 0
     if cmd == "spool":
         from .collector import spool_prune
         return spool_prune()

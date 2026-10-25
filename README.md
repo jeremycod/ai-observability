@@ -40,9 +40,20 @@ cc-usage matrix --period week          # skill × launcher token matrix
 cc-usage sessions --period today       # per-session rollups
 cc-usage ingest                        # force a transcript sweep now (request → collector)
 cc-usage backfill --days 30            # event-time-windowed historical ingest (separate offsets)
+cc-usage phases build                  # classify workflow phases + lineage + dispatch join
+cc-usage phases show <session-id>      # phase timeline + per-phase token split
+cc-usage phases show --lineage ticket:RUS-1234   # all sessions of one ticket, phase rollup
 cc-usage reconcile <session-id>        # independently recompute a session from raw transcripts
 cc-usage spool prune                   # EXPLICIT removal of replayed spool payloads (never automatic)
 ```
+
+Phase attribution (B): each response is stamped with the workflow phase that encloses it
+(implement / critic_review / revision / pr_creation / merge_gate / investigation /
+unclassified). Evidence cascade: slash commands > attributionSkill clusters > nothing
+(stays unclassified). Spans close at the next command or a ≥4 h idle gap — long tails are
+never misattributed. All sessions sharing a Jira key form one lineage; subagent usage
+attributes to the phase that dispatched it; OTLP `duration_ms` enriches matching
+transcript responses as `measured_api` latency.
 
 The database lives at `~/.local/share/cc-usage/usage.db`. Data model highlights:
 `v_model_responses` (deduplicated per-request rows, transcript source of record),

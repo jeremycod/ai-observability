@@ -341,7 +341,14 @@ class Sweeper(threading.Thread):
 
             def job(db, p=path):
                 try:
-                    ingest_file(db, p)
+                    r = ingest_file(db, p)
+                    sids = (r or {}).get("sessions") or set()
+                    if sids and os.environ.get("CC_USAGE_AUTO_PHASES", "1") != "0":
+                        from .attribution import subagents as _sub
+                        from .attribution import workflow as _wf
+                        _wf.build(db, sorted(sids))
+                        _sub.build_dispatches(db, sorted(sids))
+                        _sub.join_otel_durations(db, sorted(sids))
                 finally:
                     self.in_flight.discard(p)
             self.writer.submit(job)

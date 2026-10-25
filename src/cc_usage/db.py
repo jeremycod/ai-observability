@@ -237,7 +237,64 @@ CREATE TABLE IF NOT EXISTS backfill_state (
 );
 """
 
-MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002)]
+M003 = """
+-- Phase B: workflow attribution layer (spec v3.1 §5, §6).
+-- workflow_phases/work_lineages/phase_transitions are DERIVED data: the builder
+-- rebuilds them per session (idempotent DELETE+INSERT); raw evidence tables are
+-- never touched and nothing is ever auto-deleted.
+CREATE TABLE IF NOT EXISTS work_lineages (
+  lineage_id TEXT PRIMARY KEY,
+  primary_ticket TEXT,
+  created_at TEXT,
+  session_ids TEXT,
+  continuation_of TEXT,
+  note TEXT
+);
+CREATE TABLE IF NOT EXISTS workflow_phases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lineage_id TEXT,
+  session_id TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  started_at TEXT,
+  ended_at TEXT,
+  trigger_kind TEXT,
+  prompt_id TEXT,
+  ticket_keys TEXT,
+  pr_number INTEGER,
+  confidence TEXT,
+  basis TEXT,
+  evidence_json TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_phases_session ON workflow_phases(session_id, started_at);
+CREATE INDEX IF NOT EXISTS ix_phases_lineage ON workflow_phases(lineage_id);
+CREATE TABLE IF NOT EXISTS phase_transitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lineage_id TEXT,
+  session_id TEXT,
+  from_phase TEXT,
+  to_phase TEXT,
+  at TEXT,
+  trigger_kind TEXT,
+  evidence_json TEXT
+);
+CREATE TABLE IF NOT EXISTS subagent_dispatches (
+  parent_session_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  tool_use_id TEXT,
+  dispatch_ts TEXT,
+  phase_id INTEGER,
+  agent_type TEXT,
+  description TEXT,
+  PRIMARY KEY (parent_session_id, agent_id)
+);
+ALTER TABLE api_requests ADD COLUMN phase_id INTEGER;
+ALTER TABLE api_requests ADD COLUMN attribution_skill TEXT;
+ALTER TABLE api_requests ADD COLUMN prompt_uuid TEXT;
+ALTER TABLE otel_api_requests ADD COLUMN joined_api_request_id INTEGER;
+"""
+
+MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002),
+              (3, "phase_b_attribution", M003)]
 
 
 def now_iso():

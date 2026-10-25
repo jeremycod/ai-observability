@@ -133,19 +133,20 @@ def _subagent_meta(path):
 
 
 def process_line(db, line, source_file, byte_offset, ts_window=None):
-    """Process one complete JSONL record. Returns 'response' | 'error' | None.
+    """Process one complete JSONL record. Returns (kind, session_id) where kind is
+    'response' | 'error' | None (kind None = not an accounting record).
     ts_window=(start_epoch, end_epoch) filters by EVENT timestamp (spec §12): records
     outside the window are skipped for accounting but still consumed for offset
     bookkeeping of the backfill_state table (never the live ingest_state — critic P1-1)."""
     try:
         rec = json.loads(line)
     except ValueError:
-        return None
+        return (None, None)
     if not isinstance(rec, dict) or rec.get("type") != "assistant":
-        return None
+        return (None, None)
     msg = rec.get("message")
     if not isinstance(msg, dict) or not isinstance(msg.get("usage"), dict):
-        return None
+        return (None, None)
 
     session_id = rec.get("sessionId") or rec.get("session_id")  # canonical: sessionId (F16)
     ts = rec.get("timestamp")
@@ -153,9 +154,9 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
         w0, w1 = ts_window
         e = ts_epoch(ts)
         if w0 is not None and e < w0:
-            return None
+            return (None, session_id)
         if w1 is not None and e > w1:
-            return None
+            return (None, session_id)
     model_raw = msg.get("model")
 
     if model_raw == "<synthetic>" or rec.get("isApiErrorMessage"):
@@ -164,7 +165,7 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
                               "transcript", source_file, byte_offset,
                               json.dumps({"model": model_raw, "usage_fp": usage_fp(msg["usage"])},
                                          separators=(",", ":"))))
-        return "error"
+        return ("error", session_id)
 
     sub = _subagent_meta(source_file)
     model, ctx_variant = canonical_model(model_raw)
@@ -176,7 +177,7 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
                                     tokens[0], tokens[1], tokens[2], tokens[3], fp,
                                     now_iso())).rowcount
     if not new_occ:
-        return "response"  # occurrence already accounted; keeps re-ingest idempotent
+        return ("response", session_id)  # already accounted; keeps re-ingest idempotent
 
     row = db.execute(_SQL_SEL, (session_id, key)).fetchone()
     if row is None:
@@ -196,11 +197,11 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
             sub["display_name"] if sub else None, sub["spawn_depth"] if sub else None,
             gw, billing_for(gw) if gw else None, model_req, ctx_variant,
             provider_inferred(model), "unavailable", ts, ts))
-        return "response"
+        return ("response", session_id)
 
     if row["usage_fp"] == fp:
         _bump_occ(db, row, ts)
-        return "response"
+        return ("response", session_id)
 
     # Differing usage fingerprints: deterministic ordered-last winner (cross-file-safe order).
     new_k = order_key(ts_epoch(ts), source_file, byte_offset)
@@ -236,7 +237,7 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
             flag = "order_usage_disagree"
     db.execute("UPDATE api_requests SET reconciliation_flag=?, identity_basis='conflict-resolved' "
                "WHERE id=?", (flag, agg["id"]))
-    return "response"
+    return ("response", session_id)
 
 
 def ingest_file(db, path, ts_window=None, backfill=False):
@@ -262,6 +263,7 @@ def ingest_file(db, path, ts_window=None, backfill=False):
         w1 = ts_epoch(ts_window[1]) if ts_window[1] else None
         window = (w0, w1)
     records = 0
+    sessions = set()
     with open(path, "rb") as f:
         f.seek(offset)
         chunk = f.read()
@@ -274,10 +276,12 @@ def ingest_file(db, path, ts_window=None, backfill=False):
         line_start_offset = offset + pos
         pos = nl + 1
         if line.strip():
-            process_line(db, line, path, line_start_offset, window)
+            kind, sid = process_line(db, line, path, line_start_offset, window)
+            if sid:
+                sessions.add(sid)
             records += 1
     new_offset = offset + pos
     db.execute(_SQL_STATE.format(state_table=state_table),
                (path, new_offset, size, mtime, records, now_iso()))
     db.commit()
-    return {"records": records, "new_offset": new_offset}
+    return {"records": records, "new_offset": new_offset, "sessions": sessions}
