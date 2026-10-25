@@ -165,6 +165,17 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
                               "transcript", source_file, byte_offset,
                               json.dumps({"model": model_raw, "usage_fp": usage_fp(msg["usage"])},
                                          separators=(",", ":"))))
+        # Z.ai quota/rate-limit codes: extract code + reset hint only — the raw error
+        # text is never stored (Phase D, spec §8).
+        try:
+            content = msg.get("content")
+            err_text = content if isinstance(content, str) else \
+                (content[0].get("text", "") if isinstance(content, list) and content else "")
+            if err_text:
+                from ..quota import extract_quota_event
+                extract_quota_event(db, session_id, err_text, ts)
+        except Exception:  # noqa: BLE001 — never let extraction break ingest
+            pass
         return ("error", session_id)
 
     sub = _subagent_meta(source_file)

@@ -87,6 +87,15 @@ def build_parser():
     rv = sp.add_parser("jira", help="Jira snapshot import")
     rv.add_argument("action", choices=["import"])
     rv.add_argument("file")
+    q = sp.add_parser("quota", help="Z.ai quota windows (import/show)")
+    q.add_argument("action", choices=["import", "show"])
+    q.add_argument("file", nargs="?", default=None)
+    cst = sp.add_parser("cost", help="four-measure cost report (estimates labeled per §9)")
+    cst.add_argument("--days", type=int, default=30)
+    costp = sp.add_parser("config", help="settings (set/show)")
+    costp.add_argument("action", choices=["set", "show"])
+    costp.add_argument("key", nargs="?", default=None)
+    costp.add_argument("value", nargs="?", default=None)
     sp.add_parser("spool", help="explicit spool maintenance (`spool prune` removes "
                                 "replayed payloads; never runs automatically)")
     sp.add_parser("db", help="print database path")
@@ -267,6 +276,45 @@ def main(argv=None):
         rvmod.summary(db, os.path.expanduser(args.root) if args.action == "scan" else None)
         db.close()
         return 0
+    if cmd == "quota":
+        from . import quota
+        db = connect(DB_PATH)
+        migrate(db)
+        if args.action == "import":
+            if not args.file:
+                print("usage: cc-usage quota import <snapshot.json|kv.txt>")
+                db.close()
+                return 1
+            code = quota.import_snapshot(db, args.file)
+        else:
+            quota.show(db)
+            code = 0
+        db.close()
+        return code
+    if cmd == "cost":
+        db = connect(DB_PATH, timeout=30)
+        migrate(db)
+        _cost_report(db, period_days=int(getattr(args, "days", 30) or 30))
+        db.close()
+        return 0
+    if cmd == "config":
+        from . import cost
+        db = connect(DB_PATH)
+        migrate(db)
+        if args.action == "set":
+            if not args.key or args.value is None:
+                print("usage: cc-usage config set <key> <value>")
+                db.close()
+                return 1
+            cost.set_setting(db, args.key, args.value)
+            print("set %s" % args.key)
+        else:
+            for r in db.execute("SELECT key, value FROM settings ORDER BY key").fetchall():
+                print("%s = %s" % (r["key"], r["value"]))
+            if not args.key:
+                pass
+        db.close()
+        return 0
     if cmd == "spool":
         from .collector import spool_prune
         return spool_prune()
@@ -317,3 +365,61 @@ def _pr_outcomes(db, days=None):
         print("%-16s %10.1f %10.1f %10.1f %10.1f %10.1f" % (
             p, r.get("first_impl", 0), r.get("review", 0), r.get("revision", 0),
             r.get("pr_work", 0), r.get("merge", 0)))
+
+
+def _cost_report(db, period_days=30):
+    """Four-measure report (spec §9): observed / estimate / allocation / marginal are
+    labeled separately; Z.ai never gets an estimated_api figure."""
+    from . import cost
+    start = (dt.datetime.now(dt.timezone.utc)
+             - dt.timedelta(days=period_days)).isoformat()
+    rows = db.execute(
+        "SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, "
+        "cache_creation_tokens, record_ts FROM v_model_responses WHERE record_ts >= ?",
+        (start,)).fetchall()
+    by_provider = {}
+    est_rows = []
+    for r in rows:
+        p = r["provider"] or "unknown"
+        b = by_provider.setdefault(p, {"tok": 0, "resp": 0})
+        b["tok"] += (r["input_tokens"] or 0) + (r["output_tokens"] or 0) + \
+            (r["cache_read_tokens"] or 0) + (r["cache_creation_tokens"] or 0)
+        b["resp"] += 1
+        est_rows.append((p, r["model"], r["input_tokens"] or 0, r["output_tokens"] or 0,
+                         r["cache_read_tokens"] or 0, r["cache_creation_tokens"] or 0,
+                         ts_epoch(r["record_ts"])))
+    est, priced, unpriced = cost.estimate_provider_usd(db, est_rows)
+    inv = cost.get_setting(db, cost.INVOICE_KEY)
+    print("cost report, last %d days (labels: observed / estimate / allocation / marginal)" % period_days)
+    print("%-10s %6s %14s %12s" % ("provider", "resp", "tokens", "basis"))
+    for p in sorted(by_provider):
+        basis = ("subscription (no per-token estimate exists)" if p in cost.PLAN_PROVIDERS
+                 else "pay-per-token")
+        print("%-10s %6d %14s %12s" % (p, by_provider[p]["resp"], fmt_m(by_provider[p]["tok"]), basis))
+    print("\nestimated_api_usd  : $%.2f  [estimate; priced=%d responses, unpriced=%d;"
+          " prices=%s, DeepSeek off-peak ~%s applied]" % (
+              est, priced, unpriced, cost.PRICE_VERSION, cost.OFFPEAK["note"]))
+    if inv:
+        try:
+            inv = float(inv)
+            print("subscription        : $%.2f invoice on file (%s)" % (inv, cost.INVOICE_KEY))
+            print("amortized_usd       : $%.2f  [allocation: invoice divided across the "
+                  "billing month; NEVER ticket grain]" % (inv / 30.0 * period_days))
+        except ValueError:
+            print("subscription        : %s is not numeric" % cost.INVOICE_KEY)
+    else:
+        print("subscription        : set your actual invoice for amortization: "
+              "cc-usage config set %s <amount>" % cost.INVOICE_KEY)
+    print("marginal cash       : plan windows with spare capacity -> $0 additional; "
+          "API providers -> per-token rates above [estimate]")
+    print("quota opportunity   : UNPRICED by design — consuming scarce plan quota can "
+          "displace future work; see cc-usage quota show (shared windows)")
+
+
+def ts_epoch(ts):
+    from .ingest.transcripts import ts_epoch as _e
+    return _e(ts)
+
+
+def fmt_m(n):
+    return "%.2fM" % (n / 1e6) if n >= 1e6 else str(int(n))

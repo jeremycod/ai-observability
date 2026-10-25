@@ -348,8 +348,33 @@ CREATE TABLE IF NOT EXISTS review_artifacts (
 );
 """
 
+M005 = """
+-- Phase D: quota + cost (spec v3.1 §8, §9).
+-- quota_windows was specified in v3 §8 but never materialized by M001-M004 — created
+-- here. Note: no view may ever join it to accounting (shared-window rule).
+CREATE TABLE IF NOT EXISTS quota_windows (
+  provider TEXT,
+  kind TEXT NOT NULL,
+  window_start TEXT,
+  window_end TEXT,
+  consumed_pct_or_units REAL,
+  source TEXT NOT NULL DEFAULT 'snapshot',
+  captured_at TEXT,
+  imported_at TEXT,
+  note TEXT
+);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS price_table (
+  version TEXT NOT NULL,
+  provider TEXT NOT NULL, model TEXT NOT NULL, metric TEXT NOT NULL,
+  unit_price_usd REAL NOT NULL, note TEXT,
+  PRIMARY KEY (version, provider, model, metric)
+);
+"""
+
 MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002),
-              (3, "phase_b_attribution", M003), (4, "phase_c_correlation", M004)]
+              (3, "phase_b_attribution", M003), (4, "phase_c_correlation", M004),
+              (5, "phase_d_quota_cost", M005)]
 
 
 def now_iso():
