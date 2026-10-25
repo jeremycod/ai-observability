@@ -77,10 +77,15 @@ Rules:
    `sessionId`, F16). Invariant: **no (session_id, message_id) maps to >1 row** — enforced by
    unique index; `source_file`, `occurrences`, `byte_offsets` are non-key attributes. Cross-file
    duplicates (0 today, F12; possible after resume/compact re-serialization) resolve by a
-   deterministic winner: highest byte offset, asserted max-usage; fixture-tested.
-2. **Conflict handling:** if usage fingerprints differ, keep the last occurrence's usage (empirically
-   = max-usage, 732/732); set `identity_conflict=1`; store all fingerprints in `raw_json`. A
-   reconciliation guard flags any kept row that is not the max-usage occurrence.
+   **deterministic total order that is valid across files** — byte offsets are file-local and must
+   never be compared across files. Winner ordering: `(record_ts, source_file_path, byte_offset)`;
+   fixture-tested.
+2. **Conflict handling:** if usage fingerprints differ, the ordered-last occurrence wins; set
+   `identity_conflict=1`. Keep-last being max-usage is **empirical (732/732), not an invariant**:
+   when the ordered winner's usage differs from the max-usage occurrence, the row is flagged
+   `reconciliation_flag='order_usage_disagree'` and **all** conflicting occurrences (usage
+   fingerprints, timestamps, files, offsets) are preserved in the `api_request_conflicts` audit
+   table. Nothing is silently resolved; `cc-usage reconcile` reports these cases.
 3. **Usage fingerprint:** normalized integers with null≡0 (F-corpus has both `null` and `0` forms).
 4. **Missing `message_id`:** deterministic surrogate `sha256(session_id | source_file |
    byte_offset)` (timestamp omitted so the surrogate is rewrite-stable); `identity_basis='surrogate'`;
@@ -206,10 +211,13 @@ trigger_command, prompt_id, ticket_keys, pr_number, confidence, basis, evidence_
 | `subscription_amortized_usd` | actual Z.ai invoice (settings), allocated **at reporting-period grain (day/week) — never ticket grain** | allocation |
 | `marginal_cost_usd` | 0 for plan windows with spare capacity; estimated rate for API work | estimate |
 
-Per-provider availability: **Z.ai plan → invoice + amortized + marginal only** (no per-token
+Per-provider availability: **Z.ai plan → invoice + amortized + marginal-cash only** (no per-token
 statement exists; `estimated_api_usd` is not computed for it). **DeepSeek / OpenRouter / Anthropic
-API / Bedrock → all four.** Cross-provider financial comparisons display which measure is being
-compared and never blend amortization into marginal cost.
+API / Bedrock → all four.** **Quota opportunity cost is tracked as a separate, unpriced dimension**
+(unless real evidence prices it later): consuming scarce plan quota can displace future work or
+force overflow to a paid provider, so "marginal cash = 0" must never be presented as "costless".
+Cross-provider financial comparisons display which measure is being compared and never blend
+amortization into marginal cash cost.
 
 ## 10. Dashboard + reports
 
@@ -235,8 +243,21 @@ figure is visually tagged with its basis. CLI reports remain for terminal use.
   when full, drop-oldest with an incremented `dropped` counter surfaced in `doctor` and dashboard.
   Ordered replay on restart (single-writer makes ordering well-defined). Transcript ingest is
   offset-resumable and aborts cleanly under ENOSPC.
+- **Spool durability (reconciled with no-auto-deletion):** the spool **never deletes anything**.
+  Exact overflow policy: when spool size reaches its cap, the collector **stops accepting new
+  failed payloads** (Claude Code still gets 200 — availability first) and records a
+  `telemetry_loss` row (first/last dropped timestamps, count, reason); recovery time is recorded
+  when acceptance resumes. Coverage gaps derived from that table are surfaced in `doctor` and the
+  dashboard. Removal of spooled data happens only via explicit user command.
+- **Latency honesty — three classifications:** `measured_api` (`duration_ms` from OTLP
+  `api_request` events only), `derived_gap` (transcript-gap timing — includes streaming, client
+  processing, hidden retries; never labeled API latency), `unavailable` (TTFT always, and
+  everything when OTLP is undelivered). Every stored timing row carries `latency_basis`; reports
+  never present derived gaps as measured API duration.
 - **Hooks:** unchanged 5 s budget, actual target <50 ms; dead collector never affects Claude Code
-  (export failure → spool, no retry loop in-process).
+  (hook enqueues to spool file; export failure → spool, no retry loop in-process).
+- **Test isolation:** synthetic telemetry tests and doctor's self-check run in an isolated
+  `CC_USAGE_HOME` temp directory — synthetic records can never mix into real productivity data.
 - **Secrets/privacy:** no token values, raw prompts, assistant text, or API bodies stored;
   redaction unit test over every captured attribute path. Config snapshots (P1-8) record: CLI
   version, model/effort/compact-window env, subagent model, MCP server *names* + tool counts,
@@ -279,7 +300,7 @@ gap notes), gating Phases B/C/F:
 
 | Phase | Scope | Gate (testable as stated) |
 |---|---|---|
-| **A** | Telemetry repair + provider/session identity + migrations + spool + single-writer refactor | ≥3 real concurrent sessions yield ≥50 transcript-derived ingest rows with `identity_basis ∈ {native, conflict-resolved}` and **0 dedup violations**; migration proof on DB copy + rollback demo; identity/dedup fixture suite (incl. real harvested conflicting-id + `<synthetic>` + depth-0 + orphan fixtures) green; hook non-blocking proven (<50 ms, dead-collector survival); OTLP delivery matrix executed and outcome documented; **collection left on permanently after A** |
+| **A** | Telemetry repair + provider/session identity + migrations + spool + single-writer refactor | ≥3 real concurrent sessions yield ≥50 transcript-derived ingest rows with `identity_basis ∈ {native, conflict-resolved}` and **0 dedup violations**; migration proof on DB copy + rollback demo; identity/dedup fixture suite (incl. real harvested conflicting-id + `<synthetic>` + depth-0 + orphan fixtures) green; hook non-blocking proven (<50 ms, dead-collector survival); OTLP delivery matrix executed and outcome documented; **A12 real-data reconciliation**: several existing GLM sessions recomputed independently from raw transcripts — exact equality required wherever raw usage is complete, incomplete records reported separately; **no Claude Code upgrade, no launcher/routing changes** (baseline integrity); paid-API live testing minimal and reported; **collection left on permanently after A** |
 | **B** | Workflow state machine + subagent rollups | Multi-phase, resume-attachment, and depth-2 nesting validated on real samples (incl. datasets #3, #4) |
 | **C** | GitHub/Jira correlation | Multi-ticket + stacked PR reconciliation without duplicate credit (datasets #2, #5; multi-provider rule exercised) |
 | **D** | Quota + cost | Shared-window rule enforced; per-provider measure table honored (§9) |
@@ -300,6 +321,11 @@ gap notes), gating Phases B/C/F:
 7. OTLP metric aggregation on 2.1.206 may double-count (pre-2.1.214) — metrics stay secondary,
    tolerance-checked; transcripts are the source of record.
 8. Orca journal DB not yet opened — session↔workspace join designed but unverified (Phase E).
+9. OTLP-derived request rows are stored in a **separate** `otel_api_requests` table (never merged
+   into `api_requests`) so legacy transcript-only report semantics cannot double-count; the same
+   applies to any pre-2.1.214 metrics aggregation (kept out of accounting entirely in Phase A).
+10. Claude Code is **not** upgraded during Phase A (baseline integrity); the delivery matrix
+    verifies the installed version's actual behavior. Paid-API live tests are minimal and reported.
 
 ## Appendix A — Success questions (inlined from mission, for Phase F)
 
