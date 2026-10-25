@@ -293,8 +293,63 @@ ALTER TABLE api_requests ADD COLUMN prompt_uuid TEXT;
 ALTER TABLE otel_api_requests ADD COLUMN joined_api_request_id INTEGER;
 """
 
+M004 = """
+-- Phase C: Jira/GitHub correlation (spec v3.1 §7). PR truth is gh-sourced; review
+-- bodies are never stored (author/state/timestamp only); Jira arrives as snapshots.
+CREATE TABLE IF NOT EXISTS pull_requests (
+  number INTEGER PRIMARY KEY,
+  repo TEXT, title TEXT, branch TEXT, base_branch TEXT,
+  base_pr_number INTEGER, is_stacked_leaf INTEGER,
+  state TEXT, merged INTEGER NOT NULL DEFAULT 0, merged_at TEXT,
+  created_at TEXT, updated_at TEXT, author TEXT,
+  ticket_keys TEXT,
+  gross_add INTEGER NOT NULL DEFAULT 0, gross_del INTEGER NOT NULL DEFAULT 0,
+  changed_files INTEGER NOT NULL DEFAULT 0,
+  gen_add INTEGER NOT NULL DEFAULT 0, gen_del INTEGER NOT NULL DEFAULT 0,
+  net_add INTEGER, net_del INTEGER,
+  review_rounds INTEGER NOT NULL DEFAULT 0,
+  synced_at TEXT
+);
+CREATE TABLE IF NOT EXISTS pr_files (
+  pr_number INTEGER NOT NULL, path TEXT NOT NULL,
+  ext TEXT, generated INTEGER NOT NULL DEFAULT 0,
+  added INTEGER NOT NULL DEFAULT 0, removed INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (pr_number, path)
+);
+CREATE TABLE IF NOT EXISTS pr_reviews (
+  pr_number INTEGER NOT NULL, review_id TEXT NOT NULL,
+  author TEXT, state TEXT, at TEXT,
+  PRIMARY KEY (pr_number, review_id)
+);
+CREATE TABLE IF NOT EXISTS pr_revisions (
+  pr_number INTEGER NOT NULL, kind TEXT NOT NULL, at TEXT NOT NULL, ref TEXT NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (pr_number, kind, at, ref)
+);
+CREATE TABLE IF NOT EXISTS pr_contributions (
+  pr_number INTEGER NOT NULL, session_id TEXT NOT NULL, role TEXT NOT NULL,
+  lineage_id TEXT, launcher TEXT, provider TEXT, gateway TEXT, billing TEXT,
+  tokens INTEGER NOT NULL DEFAULT 0, responses INTEGER NOT NULL DEFAULT 0,
+  first_ts TEXT, last_ts TEXT,
+  PRIMARY KEY (pr_number, session_id, role)
+);
+CREATE TABLE IF NOT EXISTS jira_issues (
+  key TEXT PRIMARY KEY, status TEXT, summary TEXT, issuetype TEXT,
+  created TEXT, updated TEXT, imported_at TEXT
+);
+CREATE TABLE IF NOT EXISTS critic_findings (
+  root TEXT NOT NULL, topic TEXT NOT NULL, severity TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 0, at TEXT,
+  PRIMARY KEY (root, topic, severity)
+);
+CREATE TABLE IF NOT EXISTS review_artifacts (
+  root TEXT PRIMARY KEY, topics INTEGER, files INTEGER,
+  disposition TEXT, scanned_at TEXT
+);
+"""
+
 MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002),
-              (3, "phase_b_attribution", M003)]
+              (3, "phase_b_attribution", M003), (4, "phase_c_correlation", M004)]
 
 
 def now_iso():

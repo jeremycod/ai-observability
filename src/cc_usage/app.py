@@ -76,6 +76,17 @@ def build_parser():
     ph.add_argument("session_pos", nargs="?", default=None)
     ph.add_argument("--session", default=None)
     ph.add_argument("--lineage", default=None)
+    prp = sp.add_parser("pr", help="GitHub PR correlation (sync/show/outcomes)")
+    prp.add_argument("action", choices=["sync", "show", "outcomes"])
+    prp.add_argument("number", nargs="?", type=int, default=None)
+    prp.add_argument("--repo", default=None)
+    prp.add_argument("--days", type=int, default=90, help="sync/outcomes window (event-time)")
+    rvw = sp.add_parser("reviews", help="critic-artifact severity scan (scan/summary)")
+    rvw.add_argument("action", choices=["scan", "summary"], default="summary", nargs="?")
+    rvw.add_argument("--root", default="~/Sources/RustLearning/rustfolio/.claude/reviews")
+    rv = sp.add_parser("jira", help="Jira snapshot import")
+    rv.add_argument("action", choices=["import"])
+    rv.add_argument("file")
     sp.add_parser("spool", help="explicit spool maintenance (`spool prune` removes "
                                 "replayed payloads; never runs automatically)")
     sp.add_parser("db", help="print database path")
@@ -111,6 +122,17 @@ def main(argv=None):
             return spool_prune()
         print("usage: cc-usage spool prune")
         return 1
+    if first == "jira" and len(argv) > 1 and argv[1] == "import":
+        # new-phase C command; plain `cc-usage jira [key]` still delegates to v1 report
+        from .correlate.jira import import_snapshot
+        if len(argv) < 3:
+            print("usage: cc-usage jira import <snapshot.json>")
+            return 1
+        db = connect(DB_PATH, timeout=30)
+        migrate(db)
+        code = import_snapshot(db, argv[2])
+        db.close()
+        return code
     if first in LEGACY_COMMANDS:
         return _run_legacy(argv)
 
@@ -198,6 +220,53 @@ def main(argv=None):
             print("  %-16s %5d responses %14d tok" % (t["phase"], t["n"], t["tok"] or 0))
         db.close()
         return 0
+    if cmd == "pr":
+        from .correlate import github
+        db = connect(DB_PATH, timeout=180)
+        migrate(db)
+        if args.action == "sync":
+            synced, contribs = github.sync(db, days=args.days, repo=args.repo)
+            ref = github.apply_timeline_refinements(db)
+            print("pr sync: %d PRs synced, %d contribution rows, %d post-PR tail refinements"
+                  % (synced, contribs, ref))
+        elif args.action == "show" and args.number:
+            p = db.execute("SELECT * FROM pull_requests WHERE number=?", (args.number,)).fetchone()
+            if not p:
+                print("PR %d not synced" % args.number)
+                db.close()
+                return 1
+            print("PR #%s %s [%s -> %s] state=%s merged=%s rounds=%d" % (
+                p["number"], (p["title"] or "")[:70], p["branch"], p["base_branch"],
+                p["state"], p["merged"], p["review_rounds"]))
+            print("  tickets=%s net=%s(+%s gen) stacked_base=%s leaf=%s" % (
+                p["ticket_keys"],
+                "%d/- %d" % (p["net_add"] or 0, p["net_del"] or 0) if p["net_add"] is not None else "n/a",
+                "(gen +%d/-%d)" % (p["gen_add"] or 0, p["gen_del"] or 0),
+                p["base_pr_number"], p["is_stacked_leaf"]))
+            for r in db.execute("SELECT author,state,at FROM pr_reviews WHERE pr_number=? "
+                                "ORDER BY at", (args.number,)).fetchall():
+                print("  review: %-12s %-18s %s" % (r["author"], r["state"], r["at"]))
+            for c in db.execute("SELECT provider, role, tokens, responses FROM pr_contributions "
+                                "WHERE pr_number=? ORDER BY tokens DESC",
+                                (args.number,)).fetchall():
+                print("  contrib: %-14s %-10s %10d tok %4d resp"
+                      % (c["provider"], c["role"], c["tokens"] or 0, c["responses"] or 0))
+        elif args.action == "outcomes":
+            _pr_outcomes(db, args.days)
+        else:
+            print("usage: cc-usage pr sync|outcomes [--days N] | pr show <number>")
+        db.close()
+        return 0
+    if cmd == "reviews":
+        from .correlate import reviews as rvmod
+        db = connect(DB_PATH)
+        migrate(db)
+        if args.action == "scan":
+            t, fcount = rvmod.scan_root(db, args.root)
+            print("scanned %d topics / %d files under %s" % (t, fcount, args.root))
+        rvmod.summary(db, os.path.expanduser(args.root) if args.action == "scan" else None)
+        db.close()
+        return 0
     if cmd == "spool":
         from .collector import spool_prune
         return spool_prune()
@@ -210,3 +279,41 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _pr_outcomes(db, days=None):
+    """Provider outcome rollup with the shared-bucket rule (spec §7): a PR counts once;
+    multi-provider PRs land in `shared`, never in each contributing provider."""
+    from .correlate.github import outcomes
+    rows = outcomes(db, days)
+    stats = {}
+    for r in rows:
+        key = r["bucket"] if r["bucket"] in ("shared", "none") else r["bucket"]
+        s = stats.setdefault(key, {"prs": 0, "merged": 0, "rounds": 0, "net_add": 0})
+        s["prs"] += 1
+        s["merged"] += r["merged"]
+        s["rounds"] += r["rounds"]
+        s["net_add"] += r["net_add"] or 0
+    print("PR outcomes (bucket rule: multi-provider PRs counted once as 'shared')")
+    print("%-16s %5s %7s %8s %12s %8s" % ("provider/bucket", "PRs", "merged", "avg_rnd",
+                                          "net_add", "merge%"))
+    for k in sorted(stats, key=lambda x: -stats[x]["prs"]):
+        s = stats[k]
+        avg = s["rounds"] / float(s["prs"]) if s["prs"] else 0
+        mpct = (100.0 * s["merged"] / s["prs"]) if s["prs"] else 0
+        print("%-16s %5d %7d %8.1f %12d %7.0f%%" % (k, s["prs"], s["merged"], avg,
+                                                    s["net_add"], mpct))
+    role_q = ("SELECT c.provider p, c.role role, SUM(c.tokens) tok FROM pr_contributions c "
+              "JOIN pull_requests pr ON pr.number=c.pr_number %s GROUP BY 1,2"
+              % ("WHERE pr.created_at >= datetime('now', '-%d days')" % days if days else ""))
+    by = {}
+    for r in db.execute(role_q).fetchall():
+        by.setdefault(r["p"], {})[r["role"]] = (r["tok"] or 0) / 1e6
+    print("\ntokens by role (M):")
+    print("%-16s %10s %10s %10s %10s %10s" % ("provider", "first_impl", "review",
+                                              "revision", "pr_work", "merge"))
+    for p in sorted(by):
+        r = by[p]
+        print("%-16s %10.1f %10.1f %10.1f %10.1f %10.1f" % (
+            p, r.get("first_impl", 0), r.get("review", 0), r.get("revision", 0),
+            r.get("pr_work", 0), r.get("merge", 0)))

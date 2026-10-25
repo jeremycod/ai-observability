@@ -44,6 +44,11 @@ cc-usage phases build                  # classify workflow phases + lineage + di
 cc-usage phases show <session-id>      # phase timeline + per-phase token split
 cc-usage phases show --lineage ticket:RUS-1234   # all sessions of one ticket, phase rollup
 cc-usage reconcile <session-id>        # independently recompute a session from raw transcripts
+cc-usage pr sync                       # sync PR truth from gh (tickets, rounds, stacks, files)
+cc-usage pr outcomes --days 90         # provider outcome rollup (shared-bucket rule)
+cc-usage pr show 1417                  # one PR: reviews, rounds, per-provider contributions
+cc-usage reviews scan                  # critic-artifact severity counts from .claude/reviews
+cc-usage jira import snapshot.json     # Jira lifecycle snapshots (no credentials)
 cc-usage spool prune                   # EXPLICIT removal of replayed spool payloads (never automatic)
 ```
 
