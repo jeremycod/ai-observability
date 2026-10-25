@@ -94,8 +94,7 @@ def main(argv=None):
         return hook_command(DATA_DIR)
     if cmd == "collector":
         from . import collector
-        sys.argv = ["cc-usage", "collector"] + list(rest)
-        return collector.main()
+        return collector.dispatch(getattr(args, "action", "status"))
     if cmd == "doctor":
         from .doctor import run as doctor_run
         return doctor_run()

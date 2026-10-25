@@ -427,25 +427,30 @@ def stop_collector():
         pass
 
 
-def main():
-    p = argparse.ArgumentParser(prog="cc-usage collector")
-    p.add_argument("action", choices=["start", "stop", "restart", "status", "foreground"])
-    a = p.parse_args()
-    if a.action == "start":
+def dispatch(action):
+    if action == "start":
         start_collector()
         print("collector running")
-    elif a.action == "stop":
+    elif action == "stop":
         stop_collector()
         print("collector stopped")
-    elif a.action == "restart":
+    elif action == "restart":
         stop_collector()
         time.sleep(0.2)
         start_collector()
         print("collector running")
-    elif a.action == "status":
+    elif action == "status":
         print("running" if collector_alive() and port_open() else "stopped")
     else:
         collector_foreground()
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="cc-usage collector")
+    p.add_argument("action", choices=["start", "stop", "restart", "status", "foreground"])
+    a = p.parse_args()
+    return dispatch(a.action)
 
 
 if __name__ == "__main__":
