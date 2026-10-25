@@ -1,286 +1,329 @@
-# AI Coding Efficiency Observability — Design Spec v2
+# AI Coding Efficiency Observability — Design Spec v3
 
-**Date:** 2026-10-24 · **Status:** revised per architecture review (conditional approval)
+**Date:** 2026-10-24 · **Status:** critic-approved-with-changes; all findings incorporated
 **Repo:** `~/Sources/RustLearning/ai-observability` (standalone; installed to `~/.local/share/cc-usage/`)
-**Supersedes:** v1 architecture presented 2026-10-24; incorporates reviewer conditions P0-1…P0-5, P1-6…P1-12.
+**History:** v1 architecture → v2 (architecture-review corrections) → v3 (independent critic findings 1–20 incorporated)
 
 ---
 
 ## 0. Purpose
 
-Measure real engineering productivity of the multi-provider Claude Code workflow (Z.ai GLM coding plan,
-DeepSeek direct, OpenRouter, Anthropic, Bedrock) across 6–7 concurrent Orca sessions, and answer:
+Measure real engineering productivity of the multi-provider Claude Code workflow (Z.ai GLM coding
+plan, DeepSeek direct, OpenRouter, Anthropic, Bedrock) across 6–7 concurrent Orca sessions, and
+answer the eight success questions (Appendix A). Non-goals: no provider routing changes, no
+AlphaFolio code changes, no cloud telemetry, no auto-deletion.
 
-1. Tokens/cost/quota consumed per Jira ticket and per PR, across all sessions and subagents.
-2. Whether GLM throughput/quota efficiency is declining for comparable tasks.
-3. Which provider produces more accepted work per dollar and per quota unit.
-4. Whether concurrency level, workflow phase, or model config changes explain latency/usage shifts.
+## 1. Verified environment facts (audited 2026-10-24; live DB counts drift ±, noted as such)
 
-Non-goals: no provider routing changes, no AlphaFolio code changes, no cloud telemetry, no auto-deletion.
-
-## 1. Verified environment facts (audited 2026-10-24, not assumed)
-
-| Fact | Evidence |
-|---|---|
-| `cc-usage` v1.0.0 (509-line Python 3.9 stdlib tool) owns hooks (SessionStart/UserPromptSubmit/UserPromptExpansion/SessionEnd), statusline, OTLP log collector on 127.0.0.1:43182, SQLite `usage.db` | source read; `doctor` green |
-| Sessions/command attribution already work: 622 sessions, 898 command events, 1,828 prompt contexts | `usage.db` counts |
-| Per-request ingest is dead: `api_requests`=0, `tool_events`=0 | DB counts |
-| The collector ingest path itself is healthy: a synthetic OTLP `claude_code.api_request` record ingested with all fields | live probe (row inserted, then deleted) |
-| `claude_code.api_request` OTLP **log events are the documented per-request channel** (input/output/cache_read/cache_creation tokens, `duration_ms`, `request_id`, model, `prompt.id`, `session.id`) | Claude Code OTel docs (code.claude.com/docs/en/monitoring-usage); changelog 2.1.117/122/161/214/300 |
-| Real sessions never deliver those records to the collector (0 rows, no ingest errors logged) ⇒ non-delivery upstream (endpoint-env handling or exporter behavior on CLI 2.1.206), root cause TBD in Phase A | collector.log (no entries since ENOSPC ended), DB counts |
-| Transcript assistant records: `message.usage` complete; duplicate `message.id` rows are exact-usage rewrites (up to 5×); 0 null ids in sampled GLM+DS files | corpus probes 2026-10-24 |
-| Transcript `ttftMs`/`durationMs`/`requestId`: undocumented, absent in 66,713 assistant records across 281 local files (all third-party providers) | research corpus scan |
-| Subagent transcripts live at `<project>/<parentSessionId>/subagents/agent-<agentId>.jsonl` + `.meta.json`; records carry parent `sessionId`, `isSidechain=true`, `agentId`; meta has `agentType`, `description`, `name`, `toolUseId`, `spawnDepth` | file inspection |
-| Parent transcript Agent tool_use results carry matching `agentId` (join key) | grep verified |
-| `sessions.source` is always `startup` today; hook does capture `resume`/`clear`/`compact` when they occur | DB query; hook source |
-| CLI 2.1.206: past the 2.1.161 drop fix; **predates 2.1.214 metrics double-count fix**; 2.1.300 adds cache_creation_5m/1h attrs | changelog |
-| `gh` authenticated (repo scope); Atlassian MCP available interactively; Orca journal DB has session↔workspace mapping; `ORCA_PANE_KEY` env available inside Orca-spawned sessions | audit |
-| TTFT is exported nowhere in OTel (no attr, no metric); on-demand `probe.py` remains the only TTFT instrument | docs + corpus scan |
+| # | Fact | Evidence |
+|---|---|---|
+| F1 | `cc-usage` v1.0.0 (509-line Python 3.9 stdlib tool) owns hooks (SessionStart/UserPromptSubmit/UserPromptExpansion/SessionEnd), statusline, OTLP log collector on 127.0.0.1:43182 (TCP), SQLite `usage.db` | source read; `doctor` green |
+| F2 | Session/command attribution works: ~622 sessions, ~899 command events, ~1,832 prompt contexts (live-moving) | DB counts |
+| F3 | Per-request ingest dead: `api_requests`=0, `tool_events`=0 | DB counts |
+| F4 | Collector ingest path healthy: synthetic OTLP `claude_code.api_request` record ingested with all fields | live probe (inserted, then deleted) |
+| F5 | `claude_code.api_request` OTLP **log events are the documented per-request channel** (input/output/cache_read/cache_creation tokens, `duration_ms`, `request_id`, model, `prompt.id`, `session.id`) | Claude Code OTel docs (code.claude.com/docs/en/monitoring-usage); changelog 2.1.117/122/161/214/300 (doc-verified by research agent, not independently re-fetched) |
+| F6 | Real sessions never deliver those records (0 rows, no ingest errors) ⇒ non-delivery upstream; root cause TBD in Phase A | collector.log; DB counts |
+| F7 | Transcript assistant records carry complete `message.usage`. Duplicate `message.id` rows: identical-usage rewrites collapse cleanly, **and 732 ids across 322 files carry ≥2 distinct usage fingerprints** (~2% of duplicated ids; occurrences to 16×). Keep-last = max-usage verified in all 732 observed conflicts | critic corpus scan (322 files / 69,430 assistant records) |
+| F8 | `ttftMs`/`durationMs` absent (0 occurrences corpus-wide). `requestId` present in 3 records — all `<synthetic>` API-error records, Z.ai gateway format | critic scan |
+| F9 | `<synthetic>` records: 10 in corpus, `model="<synthetic>"`, real UUID `message.id`, all-zero usage, some `isApiErrorMessage:true` | critic scan |
+| F10 | Subagent transcripts at `<project>/<parentSessionId>/subagents/agent-<agentId>.jsonl` + `.meta.json` {agentType, description, name, toolUseId, spawnDepth}; records carry parent `sessionId`, `isSidechain=true`, `agentId`. Corpus: 24 subagent dirs; spawnDepth {0:7, 1:34} — **depth-0 subagents exist; depth-2 never observed** | file inspection; critic scan |
+| F11 | Parent join: `meta.toolUseId` → parent tool_use `id` resolves 34/34; filename agentId appears in parent tool-result prose 33/34; **1 orphan agent file has no parent-side result record** (crash/kill/still-running class) | critic scan |
+| F12 | 0 inline sidechain records in any parent file; 0 message.ids span >1 file (both latent risks only) | critic scan |
+| F13 | `sessions.source` all `startup` (622/622); hook does capture `resume`/`clear`/`compact` when they occur | DB; hook source |
+| F14 | CLI 2.1.206: past 2.1.161 drop fix; predates 2.1.214 metrics double-count fix; 2.1.300 adds cache_creation_5m/1h | changelog (research agent) |
+| F15 | 1,061 `ai-title` records prove background/auxiliary calls run on the same model as work calls — per-ticket token totals include this overhead | critic scan |
+| F16 | Assistant records carry both `sessionId` and `session_id` (0 mismatches in 25,212 records); canonical = `sessionId` | critic scan |
+| F17 | `gh` authenticated (repo scope); Atlassian MCP available interactively; Orca journal DB exists (session↔workspace mapping, not yet opened); `ORCA_PANE_KEY` env available in Orca sessions | audit |
+| F18 | TTFT is exported nowhere in OTel; on-demand `probe.py` remains the only TTFT instrument | docs + corpus scan |
 
 ## 2. Architecture
 
-Standalone Python 3.9 **stdlib-only** package (no venv, matches existing deployment), installed by
-`install.sh` into `~/.local/share/cc-usage/`. Existing `~/.local/bin/cc-usage` shim, hook block,
-statusline, and `usage.db` are preserved. Single background process: the existing collector (extended).
-Dashboard is an on-demand stdlib HTTP server bound to 127.0.0.1.
+Standalone Python 3.9 **stdlib-only** package, installed by `install.sh` into `~/.local/share/cc-usage/`.
+Existing `~/.local/bin/cc-usage` shim, hook block, statusline, and `usage.db` preserved. One background
+process: the collector, **extended to be the single SQLite writer** (hooks enqueue to files; §11).
+Dashboard: on-demand stdlib HTTP server on 127.0.0.1.
 
 ```
 src/cc_usage/
-  db.py                  # versioned, additive-only migrations + legacy-compat guard
-  collector.py           # OTLP logs (+metrics) HTTP server; bounded durable spool; replay
-  ingest/transcripts.py  # JSONL → request rows (primary source; identity contract §3)
+  db.py                  # additive-only migrations; legacy-compat gate; backup/rollback
+  collector.py           # OTLP logs(+metrics) server; bounded spool+replay; transcript sweeper; spool ingester; SINGLE DB WRITER
+  ingest/transcripts.py  # JSONL → model_response/api_error rows (identity contract §3)
   ingest/otel.py         # api_request/api_error/subagent_completed logs → cross-check series
-  ingest/backfill.py     # event-time-windowed historical scan; idempotent incremental
-  hooks.py               # SessionStart/Prompt*/SessionEnd; captures identity + config snapshot
-  attribution/identity.py    # launcher/gateway/serving/billing model (§4)
+  ingest/backfill.py     # event-time-windowed scan; idempotent incremental
+  hooks.py               # SessionStart/Prompt*/SessionEnd → identity+config snapshot ENQUEUED to spool file (never writes SQLite)
+  attribution/identity.py    # gateway registry, canonicalization (§4)
   attribution/workflow.py    # phase state machine (§5)
-  attribution/subagents.py   # subagent lineage + exactly-once rollups (§6)
-  correlate/github.py    # gh: PRs, reviews, revisions, diffs, merges, stacked graph (§7)
-  correlate/reviews.py   # .claude/reviews/ critic-artifact parsing (§7)
-  correlate/jira.py      # optional snapshot import (§7)
-  quota/snapshots.py     # manual Z.ai snapshot import; window math; shared-window rule (§8)
-  cost.py                # four cost measures (§9)
-  report/…  dashboard/{server.py, static/}  # CLI reports + local web dashboard (§10)
-tests/                   # unittest; synthetic fixtures; no network
+  attribution/subagents.py   # lineage + exactly-once rollups (§6)
+  correlate/{github,reviews,jira}.py   # §7
+  quota/snapshots.py     # §8     cost.py  # §9
+  report/…  dashboard/{server.py, static/}   # §10 (dashboard opens DB READ-ONLY)
+tests/                   # unittest; synthetic + real-harvested fixtures; no network
 install.sh               # copy-test migration gate; backup; idempotent
 ```
 
 CLI additions: `ingest`, `backfill`, `pr sync`, `quota import`, `jira import`, `dashboard`,
-`compare`, `config snapshot`; all existing commands unchanged.
+`compare`, `config snapshot`. Existing commands unchanged.
 
-## 3. Request identity contract (P0-1) — verified semantics, tested fallbacks
+## 3. Request identity contract (P0-1; critic findings 1, 2, 3, 16, 17)
 
-**Verified on real transcripts (GLM + DeepSeek):** one assistant API response is written to the
-session JSONL as one `message.id`; writers emit the **same record up to ~5×** with byte-identical
-usage (rewrite artifacts, ms apart). No null ids observed in sampled files. `requestId` is null on
-all third-party providers — provider request identity is *not observable* there and will never be
-claimed.
+**Counted object:** a *model_response* — one assistant API response. Transcript evidence (F7):
+duplicate `message.id` rows are usually identical-usage rewrites; **732 ids corpus-wide carry ≥2
+distinct usage fingerprints**, so conflict handling is a live path, not an edge case. Keep-last
+(max byte offset) was the correct choice in all 732 observed conflicts; validation is documented as
+**empirical**, guarded by a reconciliation check (below).
 
-Ingestion therefore distinguishes the objects it counts and never silently equates them:
+Rules:
+1. **Identity grain:** `(session_id, message_id)` at the transcript layer (canonical field
+   `sessionId`, F16). Invariant: **no (session_id, message_id) maps to >1 row** — enforced by
+   unique index; `source_file`, `occurrences`, `byte_offsets` are non-key attributes. Cross-file
+   duplicates (0 today, F12; possible after resume/compact re-serialization) resolve by a
+   deterministic winner: highest byte offset, asserted max-usage; fixture-tested.
+2. **Conflict handling:** if usage fingerprints differ, keep the last occurrence's usage (empirically
+   = max-usage, 732/732); set `identity_conflict=1`; store all fingerprints in `raw_json`. A
+   reconciliation guard flags any kept row that is not the max-usage occurrence.
+3. **Usage fingerprint:** normalized integers with null≡0 (F-corpus has both `null` and `0` forms).
+4. **Missing `message_id`:** deterministic surrogate `sha256(session_id | source_file |
+   byte_offset)` (timestamp omitted so the surrogate is rewrite-stable); `identity_basis='surrogate'`;
+   resumability keyed on `(source_file, byte_offset)` upserts. Collision tests required.
+5. **Synthetic/error records (F9):** records with `model == "<synthetic>"` or
+   `isApiErrorMessage == true` are stored as **`api_error` objects, never model_response**;
+   `model_observed` stays NULL for them. (Prevents request-count/latency inflation.)
+6. **Retries** invisible to transcripts are a documented gap; exhausted retries surface as the F9
+   record class and OTLP `api_error` events. Streaming chunks, tool uses, and turns are derived
+   objects, never conflated with model_responses.
+7. Fixtures: real harvested (16× duplicates; conflicting-id class from
+   `agent-abb09bfa173540b88.jsonl`; `<synthetic>` records; depth-0 subagent files; orphan agent
+   file) **plus** synthetic edge cases (cross-file duplicate, null-id surrogate).
 
-- **model_response** (the unit stored in `api_requests`): identity =
-  `(session_id, message_id)` **when usage fingerprints of all occurrences agree** (verified common
-  case) → collapse to one row, store `occurrences=N`.
-- If the same `message_id` appears with **differing usage fingerprints**: keep the **last**
-  occurrence's usage (final cumulative), flag `identity_conflict=1`, keep all fingerprints in
-  `raw_json` for audit. Unit-tested with crafted fixtures.
-- If `message_id` is absent/unparseable: deterministic surrogate
-  `sha256(session_id | file_path | byte_offset | timestamp)` with `identity_basis='surrogate'`;
-  collision tests required.
-- Every row preserves `source_file`, `byte_offset`, `occurrences`, `identity_basis`,
-  `provider_request_id` (null unless observed), so any aggregate can be re-audited to source lines.
-- **Retries** invisible to transcripts are a documented gap; only exhausted retries surface (as
-  `isApiErrorMessage` records / OTLP `api_error` events). Streaming chunks, tool uses, and turns are
-  separate derived objects (turn rollups), never conflated with model_responses.
-- Dedup invariants enforced by unique index `(session_id, message_id, source)` + suite tests
-  (`test_token_accounting.py`, `test_dedup.py`), including: re-ingest = 0 new rows; parent vs
-  subagent files never double-count one response.
+## 4. Provider identity — four dimensions + registry (P0-2; findings 3, 15, 18)
 
-## 4. Provider identity — four dimensions (P0-2)
+Per session and per response: `launcher`, `gateway`, `model_requested`, `model_observed`,
+`serving_provider` (**NULL unless verified**; direct gateways = gateway itself; OpenRouter stays
+unknown absent routing evidence), `billing_provider`.
 
-Per session (hooks, env) and per response (transcript/OTLP):
+- **Versioned gateway registry:** normalized mapping (URL trimmed of trailing `/`, path-insensitive
+  match) `api.z.ai/api/anthropic → zai`, `openrouter.ai/api → openrouter`,
+  `api.deepseek.com/anthropic → deepseek`, `api.anthropic.com → anthropic`,
+  `bedrock-runtime.*.amazonaws.com → aws-bedrock`; unknown URLs stored verbatim with
+  `gateway='unmapped'`.
+- **Model canonicalization:** requested `[1m]` suffix is a context-window variant marker, not a
+  distinct model: `model_requested="glm-5.3-flash[1m]"`, `model_observed="glm-5.3-flash"` →
+  canonical model `glm-5.3-flash`, `ctx_variant='1m'`. Comparisons group by
+  `(gateway, canonical model, billing_provider)` — never by model name alone.
+- **Env captured at SessionStart *and* UserPromptSubmit** (mid-session gateway/model changes are
+  detected, not missed).
+- **Background-call caveat (F15):** per-ticket/per-session token totals include auxiliary calls
+  (ai-title generation, etc.); identical phenomenon across providers, so comparisons remain valid;
+  caveat printed on every affected report. A `call_purpose` field is added if/when OTLP delivery is
+  repaired (OTel `query_source` attr).
+- Historical sessions without instrumented env: `gateway=NULL`, `serving_provider=NULL`,
+  `provider_inferred` kept **out of authoritative comparisons** until explicitly blessed.
 
-| Column | Source | Example |
-|---|---|---|
-| `launcher` | `CC_LAUNCHER` env | `claude-glm` |
-| `gateway` | `ANTHROPIC_BASE_URL` at session start | `api.z.ai/api/anthropic` → `zai` |
-| `model_requested` | `ANTHROPIC_MODEL` env | `glm-5.3-flash[1m]` |
-| `model_observed` | per-response `message.model` | `glm-5.3-flash` |
-| `serving_provider` | **NULL unless verified** (direct gateways = gateway itself; OpenRouter stays unknown unless routing evidence exists) | `zai` / NULL |
-| `billing_provider` | launcher registry (plan vs API vs subscription vs org) | `zai-plan`, `deepseek-api` |
+## 5. Workflow phases — explicit state machine (P0-3; findings 6, 7)
 
-Comparisons group by `(gateway, model_observed, billing_provider)` — never by model name alone
-(OpenRouter-hosted GLM ≠ Z.ai-hosted GLM). Historical sessions without instrumented env get
-`gateway=NULL`, `serving_provider=NULL`, plus `provider_inferred` (model-id heuristic) kept **out of
-authoritative comparisons** until explicitly blessed. Model changes mid-session are recorded
-per-response; a session summary exposes the set.
+Tables: `work_lineages`, `workflow_phases` (phase, lineage_id, session_id, started_at, ended_at,
+trigger_command, prompt_id, ticket_keys, pr_number, confidence, basis, evidence_json),
+`phase_transitions`. Phases: `implement`, `critic_review`, `revision`, `pr_creation`,
+`chatgpt_followup`, `merge_gate`, `investigation`, `maintenance`, `unclassified`.
 
-## 5. Workflow phases — explicit state machine (P0-3)
+- **Boundaries:** every phase has start/end timestamps, trigger, evidence, confidence. Multiple
+  commands per session → multiple phases.
+- **Overlap/nesting semantics:** phase intervals **may nest within a session** (e.g. a critic
+  subagent runs while the parent is in `implement`). Token/time attribution joins each
+  model_response row to the **innermost enclosing phase of its session at that row's timestamp**.
+  Phase durations are never summed as disjoint wall-clock; the dashboard shows a timeline, not a
+  partition.
+- **Prompt linkage:** `promptId` exists on user records only; assistant records link to their
+  prompt via the `parentUuid` chain to the nearest-preceding user record; `last-prompt` /
+  `leafUuid` records terminate chains. Subagent tokens attribute to the **phase active at their
+  dispatch timestamp** (resolved via parent `toolUseId`), not per-timestamp.
+- Classification cascade: (1) `UserPromptExpansion` command names scoped by resolved prompt;
+  (2) transcript `attributionSkill`; (3) structural evidence (PR on ticket branch,
+  `.claude/reviews/` artifact, commit windows). ChatGPT-follow-up is multi-signal only. Ambiguous →
+  `unclassified` interval, never guessed.
+- **Resumes:** attach to existing `work_lineage` when hook `source=resume` or ticket/branch/PR
+  continuation matches with evidence; otherwise new lineage with flagged `continuation_of`
+  candidate. (No resumes in corpus, F13 — ships behind fixtures + Phase B real-case gate.
+  Resume/compact re-serialization behavior is untested and listed in §16.)
 
-Tables: `work_lineages` (lineage_id, primary_ticket, session_ids, created_at),
-`workflow_phases` (phase, lineage_id, session_id, started_at, ended_at, trigger_command,
-prompt_id, ticket_keys, pr_number, confidence, basis, evidence_json), `phase_transitions`.
+## 6. Subagent accounting — exactly once (P0-4; findings 4, 5, 19)
 
-- Phases: `implement`, `critic_review`, `revision`, `pr_creation`, `chatgpt_followup`,
-  `merge_gate`, `investigation`, `maintenance`, `unclassified`.
-- **Boundaries:** each phase has start/end timestamps, trigger (command name / skill attribution /
-  structural event), evidence, and confidence. Multiple commands per session → multiple phases.
-- Classification cascade: (1) `UserPromptExpansion` command names scoped by `prompt_id`;
-  (2) transcript `attributionSkill`; (3) structural evidence (PR opened on ticket branch,
-  `.claude/reviews/<topic>/` artifact created, commit windows). ChatGPT-follow-up is multi-signal
-  only (never keyword). Anything ambiguous → `unclassified` interval, never guessed.
-- **Resumes:** a resumed session attaches to the existing `work_lineage` when hook `source=resume`,
-  or when ticket/branch/PR continuation matches with evidence; otherwise a new lineage is created
-  with an explicit `continuation_of` link candidate flagged for review. (No resumes exist in the
-  current corpus — 622/622 `startup` — so this path ships with fixtures + real-case validation in
-  Phase B.)
-- Lineage → ticket attribution: command args, branch, prompt_context, PR markers (RUS-#### regex
-  is one *input*; multi-signal confirmation required for `confirmed` confidence).
-
-## 6. Subagent accounting — exactly once (P0-4)
-
-Verified layout (§1). Ingestion:
-
-- Ingest `subagents/agent-<agentId>.jsonl` files as rows with `is_sidechain=1`,
-  `parent_session_id` (=record sessionId), `agent_id`, and `agent_type`/`agent_name`/`description`
-  from `meta.json`; `spawn_depth` supports nesting.
-- Join parent side: Agent tool_use results carry `agentId` (+ `toolUseId` in meta) → contributes
-  `dispatch_ts`, `subagent_type`, and the parent phase.
+- **Subagent-ness is keyed on file location** (`subagents/agent-*.jsonl` / `is_sidechain=1`),
+  **not** `spawnDepth` (F10: depth-0 subagents exist); `spawn_depth` stored descriptive-only.
+- Ingest: rows with `is_sidechain=1`, `parent_session_id`, `agent_id`, `agent_type`/`agent_name`/
+  `description` from meta.json.
+- **Join:** primary = `meta.toolUseId` → parent tool_use `id` (34/34, F11); prose agentId is
+  confirmation only.
+- **Orphan case** (no parent-side result record): a counted, expected state — tokens ingested,
+  `dispatch_ts`/phase NULL, surfaced in coverage stats; never an ingest error.
 - **Exactly-once rule:** session/ticket rollups = main-chain rows + Σ(subagent rows). Guards:
-  (a) audit query proving no subagent records appear inline in parent files (verified true today:
-  parent files contain 0 sidechain records); (b) unique index on `(session_id, message_id,
-  source_file)`; (c) fixture tests for depth-2 nesting (spawnDepth=2) summing each agent exactly
-  once; (d) reconciliation report comparing DB rollups against raw-sum ground truth per session.
-- OTLP `subagent_completed` events cross-check counts (not tokens; metrics are aggregates).
+  (a) corpus audit query (no inline sidechains — true today, F12); (b) unique index per §3 grain;
+  (c) depth-0 and depth-2 fixture tests summing each agent exactly once; (d) per-session
+  reconciliation report vs raw-sum ground truth.
+- **Nesting (depth-2):** never observed (F10); will be **deliberately produced in a scratch session
+  during Phase B** and stored as the fixture (validation dataset #4 amended accordingly).
+- `SendMessage`-continuation appends to an existing agent file across parent phases: tokens
+  attribute to the dispatch phase; continuation segments are visible in the timeline.
 
-## 7. Jira / GitHub correlation (P1-6)
+## 7. Jira / GitHub correlation (P1-6; findings 9, 10)
 
-- **GitHub via `gh` (authoritative for outcomes):** PR list/detail incl. base branch (stacked PRs),
-  additions/deletions/files per commit (gross vs net), review/comment timeline vs pushes (revision
+- **GitHub via `gh` (authoritative for outcomes):** PRs incl. base branch (stacked graph),
+  per-commit additions/deletions/files (gross vs net), review/comment timeline vs pushes (revision
   rounds), merge status, CI checks. PR↔ticket via branch/title/body markers; multi-ticket PRs get
-  per-ticket links; follow-up bug tickets link to parent PR (e.g. RUS-6221 → #1418).
-- `pr_contributions(pr_number, lineage_id, session_id, provider_dims…, role ∈ {first_impl, review,
-  revision, followup}, tokens, duration)` — PR-level outcomes counted **once per PR**; provider
-  comparisons aggregate contributions with weights shown. Unique constraints + tests prevent
-  double-credit (multi-ticket PR, multi-provider PR, follow-up corrections).
-- **Critic findings by severity** parsed from `.claude/reviews/<topic>/` artifacts; review
-  disposition recorded (accepted/changes-requested/unresolved).
-- **Tests-executed evidence** from transcript `toolUseResult` within phase windows.
-- **Jira lifecycle:** snapshot import (`cc-usage jira import export.json`); no new credentials; a
-  read-only Keychain token is a future opt-in. Merged ≠ correct: merge status never upgrades quality.
-- Language distribution from changed-file extensions; generated files (lockfiles, migrations,
-  snapshots) excluded from productivity comparisons by configurable pattern list.
+  per-ticket links; follow-up bug tickets link to parent PRs.
+- **Multi-provider PR allocation rule (defined):** a PR's outcome is counted **once**. PR **count**
+  attributes to a `shared` bucket when >1 provider contributed (never to each provider); provider
+  **token/time** metrics attribute fractionally by observed token share, with the weights displayed
+  next to every such number. No view may sum provider-attributed PR counts to >1 per PR.
+- **Stacked PRs:** incremental additions/deletions attribute to the **leaf** PR of the stack only;
+  base PRs carry zero incremental LOC for productivity comparisons.
+- Critic findings by severity from `.claude/reviews/<topic>/` artifacts; review disposition
+  recorded. Tests-executed evidence from transcript `toolUseResult` within phase windows. Language
+  distribution from extensions; generated files excluded via configurable pattern list.
+- **Jira lifecycle:** snapshot import (`cc-usage jira import export.json`); no new credentials;
+  read-only Keychain token is a future opt-in. Merged ≠ correct — merge status never upgrades
+  quality.
 
 ## 8. Quota — observed windows, no invented conversions (P0-5)
 
 - `quota_windows(provider, kind ∈ {5h, weekly}, window_start, window_end, consumed_pct_or_units,
-  source ∈ {snapshot, derived_from_error}, imported_at)` — snapshots via `cc-usage quota import`
-  (paste or file; schema-flexible parser, stores raw + normalized). Exhaustion/rate-limit events
-  (1302/1308/1310) from `provider_events` carry reset timestamps when present.
+  source ∈ {snapshot, derived_from_error}, captured_at, imported_at)` — snapshots via
+  `cc-usage quota import`; **both the window timestamps and the snapshot capture time are recorded
+  separately** (user-supplied values may be pasted after the fact). Exhaustion/rate-limit events
+  (1302/1308/1310) land in `provider_events` with reset timestamps when present.
 - **Shared-window rule:** when >1 session is active in a window, consumption is "shared evidence";
-  per-ticket quota attribution is **forbidden by construction** (no view computes it). Dashboard
-  shows active-session lists per window instead. Correlations between token series and quota
-  snapshots are shown as side-by-side series with uncertainty notes — never as conversion.
-- No token→quota coefficient exists anywhere in code or docs. Marginal-capacity observations
-  ("window had spare capacity") are the only quota-based marginal statement.
+  per-ticket quota attribution is **forbidden by construction** (no view computes it). Quota
+  efficiency exists **only at provider-window grain** (tokens per window alongside active-session
+  counts), and every quota/token juxtaposition carries the caption "shared window, N active
+  sessions, no conversion". Side-by-side series with uncertainty notes only.
 
-## 9. Cost — four separate measures (P1-9)
+## 9. Cost — four measures with per-provider availability (P1-9; findings 11, 12)
 
 | Measure | Source | Label |
 |---|---|---|
-| `actual_billed_usd` | imported provider statements/exports (manual; DeepSeek/OpenRouter dashboards) | observed |
+| `actual_billed_usd` | imported statements/exports (manual) | observed |
 | `estimated_api_usd` | versioned price table × observed tokens (DeepSeek peak/off-peak + cache tiers; OpenRouter approximate) | estimate |
-| `subscription_amortized_usd` | actual Z.ai invoice (settings) allocated by usage share | allocation |
+| `subscription_amortized_usd` | actual Z.ai invoice (settings), allocated **at reporting-period grain (day/week) — never ticket grain** | allocation |
 | `marginal_cost_usd` | 0 for plan windows with spare capacity; estimated rate for API work | estimate |
 
-Amortization is never presented as marginal cost; the dashboard keeps them in separate columns and
-explains the allocation method inline.
+Per-provider availability: **Z.ai plan → invoice + amortized + marginal only** (no per-token
+statement exists; `estimated_api_usd` is not computed for it). **DeepSeek / OpenRouter / Anthropic
+API / Bedrock → all four.** Cross-provider financial comparisons display which measure is being
+compared and never blend amortization into marginal cost.
 
-## 10. Dashboard + reports (§7 of mission)
+## 10. Dashboard + reports
 
-`cc-usage dashboard` → 127.0.0.1:4399, read-only SQLite, zero-dependency static HTML/JS.
-Views: provider comparison (accepted PRs, tickets, tokens by type, wall/tool-active time, cost &
-quota, tokens/PR, revision rounds, first-pass acceptance), workflow-phase breakdown, session
-timeline drilldown (requests, tools, subagents, commits, errors, compactions), concurrency buckets
-(1–2 / 3–4 / 5–7+ via Orca journal + session overlap), daily/weekly trends, quota panel with
-shared-window labels, filters (provider/model/command/ticket/PR/date/complexity). Every derived or
-estimated figure is visually tagged with its basis. CLI reports remain for terminal use.
+`cc-usage dashboard` → 127.0.0.1:4399, read-only SQLite, zero-dependency static HTML/JS. Views:
+provider comparison (accepted PRs, tickets, tokens by type, wall/tool-active time, cost & quota,
+tokens/PR, revision rounds, first-pass acceptance), workflow-phase breakdown, session timeline
+drilldown (requests, tools, subagents, commits, errors, compactions), concurrency buckets (1–2 /
+3–4 / 5–7+ via session overlap + Orca journal), daily/weekly trends, quota panel with shared-window
+captions, filters (provider/model/command/ticket/PR/date/complexity). Every derived/estimated
+figure is visually tagged with its basis. CLI reports remain for terminal use.
 
-## 11. Reliability, safety, migrations (P1-7, P1-8)
+## 11. Reliability, safety, migrations (P1-7, P1-8; findings 8, 20)
 
-- **Migration contract:** every migration (a) runs first against a **copy of the live DB** in the
-  test suite, (b) must keep the legacy `cc_usage.py` queries (statusline, hooks, reports) passing
-  unchanged, (c) is additive-only (new tables/columns/views/indexes), (d) is preceded by an
-  automatic `cc-usage backup`, with demonstrated restore. `install.sh` aborts if (a)/(b) fail.
-- **Bounded spool:** failed OTLP persists go to a disk spool with max size (default 200 MB,
-  configurable); when full: drop oldest with an incremented `dropped` counter surfaced in `doctor`
-  and the dashboard ("telemetry loss" indicator). Ordered replay on restart. Transcript ingest is
-  offset-resumable and likewise safe under ENOSPC (aborts cleanly, resumes later).
-- **Hooks:** unchanged timeout (5 s), collector never in the request path; a dead collector must
-  not affect Claude Code (fire-and-forget UDP-style OTLP export + spool).
-- **Secrets:** no token values, raw prompts, assistant text, or API bodies stored (existing privacy
-  posture preserved); redaction unit test over every captured attribute path; config snapshots
-  (P1-8) record: CLI version, model/effort/compact-window env, subagent model, MCP server *names* +
-  tool counts, permission mode, plugin names, `ORCA_PANE_KEY` presence, load-average sample —
-  never values of credential-bearing vars.
-- **Idempotency everywhere:** backfill rerun = 0 new rows; ingestion resumable; no auto-deletion
-  of anything, ever.
+- **Single-writer concurrency policy:** hooks **never write SQLite** — they enqueue one JSON line
+  to a per-session spool file (<1 ms); the collector is the sole DB writer (transcript sweeper +
+  spool ingester + OTLP ingester serialized through one connection with explicit `busy_timeout`,
+  WAL confirmed); dashboard opens read-only. Contention test with 7 simulated concurrent writers.
+- **Migration contract:** each migration (a) runs first against a **copy of the live DB** in the
+  test suite, (b) keeps the legacy `cc_usage.py` queries (statusline, hooks, reports) passing
+  unchanged, (c) is additive-only, (d) is preceded by an automatic `cc-usage backup` with
+  demonstrated restore. `install.sh` aborts if (a)/(b) fail.
+- **Bounded spool:** failed OTLP persists → disk spool, max size (default 200 MB, configurable);
+  when full, drop-oldest with an incremented `dropped` counter surfaced in `doctor` and dashboard.
+  Ordered replay on restart (single-writer makes ordering well-defined). Transcript ingest is
+  offset-resumable and aborts cleanly under ENOSPC.
+- **Hooks:** unchanged 5 s budget, actual target <50 ms; dead collector never affects Claude Code
+  (export failure → spool, no retry loop in-process).
+- **Secrets/privacy:** no token values, raw prompts, assistant text, or API bodies stored;
+  redaction unit test over every captured attribute path. Config snapshots (P1-8) record: CLI
+  version, model/effort/compact-window env, subagent model, MCP server *names* + tool counts,
+  permission mode, plugin names, `ORCA_PANE_KEY` presence, load-average sample — never
+  credential-bearing values.
+- **Health:** `doctor` v2 adds `PRAGMA quick_check`, spool/loss indicators, and a weekly scheduled
+  backup reminder with on-demand `cc-usage backup`.
+- **Idempotency everywhere:** backfill rerun = 0 new rows; no auto-deletion of anything, ever.
 
 ## 12. Backfill & provenance eras (P1-10)
 
-`cc-usage backfill --days 30` (or `--since/--until`): selects sessions by **event timestamps**
-(record `timestamp` ∈ window), not file mtime; supports incremental refresh of still-growing files
-(size+offset+hash re-check). Provenance eras: `instrumented` (CC_PROVIDER env known) vs `historical`
-(provider unknown/inferred) — the dashboard separates them by default and every §8-mission report
-shows coverage ("X% of requests have provider identity, Y% have phase attribution").
+`cc-usage backfill --days 30 | --since/--until`: selects sessions by **event timestamps**
+(record `timestamp` ∈ window), not file mtime; incremental refresh of growing files via
+size+offset+hash re-check. Provenance eras: `instrumented` (CC_PROVIDER known) vs `historical`
+(provider unknown/inferred) — dashboard separates them by default; coverage stats
+("% requests with provider identity / phase attribution") shown on every summary.
 
-## 13. Comparison methodology (P1-12)
+## 13. Comparison methodology (P1-12; finding 12)
 
-`cc-usage compare` and dashboard views: speed, token efficiency, quota efficiency, financial
-efficiency, rework (revision rounds, post-review churn), quality (findings by severity, post-merge
-fix tickets) — grouped by matched-task sets (same epic/ticket type; complexity from
-pre-implementation signals and structural size only — never from provider-dependent outcomes),
-with sample sizes, Wilson intervals, and a confounds panel (concurrency level, quota-exhaustion
-overlap, disk incidents, config-snapshot deltas). LOC/PR counts are never equated with productivity;
-observations vs inferences are separated in every view.
+`cc-usage compare` + dashboard views: speed, token efficiency, **quota efficiency (provider-window
+grain only, per §8)**, financial efficiency (measure-labeled per §9), rework (revision rounds,
+post-review churn), quality (findings by severity, post-merge fix tickets) — grouped by
+matched-task sets (same epic/ticket type; complexity from pre-implementation signals and structural
+size only), with sample sizes, Wilson intervals, and a confounds panel (concurrency level,
+quota-exhaustion overlap, disk incidents, config-snapshot deltas). LOC/PR counts are never equated
+with productivity; observations vs inferences separated in every view.
 
-## 14. Validation dataset (P1-11)
+## 14. Validation dataset (P1-11; findings 19, 9)
 
-Five real AlphaFolio cases reconciled manually against raw evidence, stored as fixtures + expected
-values + explicit gap notes, gating Phases B/C/F:
+Five real cases reconciled manually against raw evidence (fixtures + expected values + explicit
+gap notes), gating Phases B/C/F:
 1. Straightforward single-ticket implementation.
-2. PR with multiple Jira issues.
+2. PR with multiple Jira issues — gate includes the multi-provider allocation rule (§7).
 3. Long session with several workflow commands (multi-phase).
-4. Implementation with multiple subagents (incl. nesting).
+4. Implementation with multiple subagents — nesting case **deliberately produced in a scratch
+   session during Phase B** (none exists in the corpus, F10) and stored as the fixture.
 5. PR with ChatGPT-review follow-up and multiple revisions.
 
 ## 15. Phases & gates
 
-| Phase | Scope | Gate (must pass before next phase) |
+| Phase | Scope | Gate (testable as stated) |
 |---|---|---|
-| **A** | Telemetry repair + provider/session identity + migrations + spool | E2E events from ≥3 real concurrent sessions; safe-migration proof on DB copy + rollback; identity/dedup fixture suite; non-blocking proven; OTLP delivery verified or decision documented; **collection stays on permanently after A** |
-| **B** | Workflow state machine + subagent rollups | Multi-phase session, resume, nested-subagent cases validated on real samples (incl. validation dataset #3, #4) |
-| **C** | GitHub/Jira correlation | Multi-ticket + stacked PR reconciliation without duplicate credit (dataset #2, #5) |
-| **D** | Quota + cost | Shared-window rule enforced; four cost measures separated (dataset evidence) |
-| **E** | Dashboard + backfill | §10 views live; 30-day backfill with provenance eras; rerun = 0 duplicates |
-| **F** | Comparative validation | §13 methodology on real data; validation dataset #1–#5 reconciled; mission's eight success questions answered with sample sizes + uncertainty |
-
-Phase A is deliberately minimal so reliable capture begins accumulating history immediately after
-its gate, while B–F are built.
+| **A** | Telemetry repair + provider/session identity + migrations + spool + single-writer refactor | ≥3 real concurrent sessions yield ≥50 transcript-derived ingest rows with `identity_basis ∈ {native, conflict-resolved}` and **0 dedup violations**; migration proof on DB copy + rollback demo; identity/dedup fixture suite (incl. real harvested conflicting-id + `<synthetic>` + depth-0 + orphan fixtures) green; hook non-blocking proven (<50 ms, dead-collector survival); OTLP delivery matrix executed and outcome documented; **collection left on permanently after A** |
+| **B** | Workflow state machine + subagent rollups | Multi-phase, resume-attachment, and depth-2 nesting validated on real samples (incl. datasets #3, #4) |
+| **C** | GitHub/Jira correlation | Multi-ticket + stacked PR reconciliation without duplicate credit (datasets #2, #5; multi-provider rule exercised) |
+| **D** | Quota + cost | Shared-window rule enforced; per-provider measure table honored (§9) |
+| **E** | Dashboard + backfill | §10 views live; 30-day event-time backfill with provenance eras; rerun = 0 duplicates |
+| **F** | Comparative validation | §13 methodology on real data; datasets #1–#5 reconciled; Appendix A questions answered with sample sizes + uncertainty |
 
 ## 16. Open assumptions & risks (unresolved)
 
-1. **OTLP non-delivery root cause** (endpoint-env handling vs exporter behavior on 2.1.206) —
-   diagnosed in Phase A with an env-var delivery matrix; transcripts are primary regardless, so
-   Phase A does not depend on its outcome.
-2. **CLI 2.1.206 predates 2.1.214 telemetry fixes** — upgrading Claude Code is recommended but is a
-   user decision; capture design works on both.
-3. **First-party-vs-third-party `ttftMs` hypothesis unverified** — TTFT treated as unavailable
-   until a first-party session proves otherwise; probe.py remains the on-demand instrument.
-4. **Resume behavior** unobserved in corpus (622/622 startup) — shipped behind fixtures + Phase B
-   real-case gate.
-5. **Z.ai quota semantics** (units, tier exacts) remain third-party-sourced until dashboard
-   snapshots ground them; re-verify docs once in Phase D.
-6. **Jira transitions** require either snapshot imports or a future user-supplied read-only token.
-7. Metric-level OTLP aggregation on 2.1.206 may double-count (pre-2.1.214) — OTLP metrics stay a
-   secondary, tolerance-checked series only; transcripts are the accounting source of record.
+1. OTLP non-delivery root cause (endpoint-env handling vs exporter behavior on 2.1.206) — Phase A
+   delivery matrix; transcripts are primary regardless.
+2. CLI 2.1.206 predates 2.1.214 telemetry fixes — upgrade recommended, user decision.
+3. First-party `ttftMs` hypothesis unverified — TTFT treated as unavailable.
+4. **Resume/compact re-serialization unobserved** (F13) — cross-file id behavior untested until a
+   real resume occurs; guarded by §3.1 invariant + fixture.
+5. Z.ai quota semantics third-party-sourced until dashboard snapshots ground them (Phase D doc
+   re-check).
+6. Jira transitions need snapshot imports or a future read-only token.
+7. OTLP metric aggregation on 2.1.206 may double-count (pre-2.1.214) — metrics stay secondary,
+   tolerance-checked; transcripts are the source of record.
+8. Orca journal DB not yet opened — session↔workspace join designed but unverified (Phase E).
+
+## Appendix A — Success questions (inlined from mission, for Phase F)
+
+1. How many tokens did RUS-6225 consume across all implementation and review sessions?
+2. How much Z.ai quota was consumed to produce PR #1419? *(answerable only as shared-window
+   evidence per §8)*
+3. Which command consumes the most tokens?
+4. Does `challenge-artifact` materially improve PR acceptance?
+5. Are GLM sessions becoming slower for comparable tasks?
+6. Does DeepSeek produce more accepted work per dollar?
+7. Do seven concurrent sessions increase or decrease total throughput?
+8. How many additional revision rounds are required by each provider — and which provider is most
+   efficient for implementation versus independent review?
+
+## Changelog v3
+
+Critic findings incorporated: #1 §1/§3 conflict facts corrected, real-fixture mandate; #2 synthetic
+records routed to api_errors; #3 identity grain unified `(session_id, message_id)` + cross-file
+fixture/invariant; #4 subagent-ness keyed on location not depth; #5 toolUseId primary join + orphan
+state; #6 nested/overlapping phase semantics + innermost-phase attribution; #7 assistant→prompt
+parentUuid-chain rule; #8 single-writer policy + busy_timeout + contention test; #9 multi-provider
+PR allocation rule defined; #10 stacked-PR LOC to leaf; #11 per-provider cost measure table +
+period-grain amortization; #12 quota efficiency window-grain + mandatory captions; #13 Phase A gate
+made testable; #14 mission questions inlined (Appendix A); #15 requestId fact corrected + gateway
+registry + model canonicalization + prompt-time env capture; #16 timestamp dropped from surrogate;
+#17 fingerprint normalization null≡0; #18 background-call caveat; #19 depth-2 fixture produced in
+Phase B scratch session; #20 sessionId canonical + doctor quick_check + snapshot capture-time.
