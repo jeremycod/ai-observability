@@ -68,13 +68,36 @@ class TestHookSpool(Base):
         _state2, payloads2 = read_events(self.home)
         self.assertEqual(payloads2, [])
 
+    def test_prompt_text_never_reaches_disk(self):
+        """Critic P0-1 regression: raw prompt/command text must be reduced before write."""
+        secret_prompt = "Please investigate RUS-6225 and DO-NOT-LEAK-THIS-STRING token"
+        enqueue(self.home, {"hook_event_name": "UserPromptSubmit", "session_id": "sP",
+                            "prompt_id": "pp1", "prompt": secret_prompt})
+        enqueue(self.home, {"hook_event_name": "UserPromptExpansion", "session_id": "sP",
+                            "prompt_id": "pp2", "command_name": "implement-jira-ticket",
+                            "command_args": "implement RUS-7 DO-NOT-LEAK-COMMAND",
+                            "prompt": secret_prompt})
+        path, _ = events_path(self.home)
+        blob = open(path, encoding="utf-8").read()
+        self.assertNotIn("DO-NOT-LEAK-THIS-STRING", blob)
+        self.assertNotIn("DO-NOT-LEAK-COMMAND", blob)
+        payload2 = [json.loads(l) for l in blob.splitlines()][1]
+        self.assertEqual(payload2["prompt_jira"], "RUS-6225")
+        self.assertEqual(payload2["command_args_jira"], "RUS-7")
+        self.assertEqual(payload2["prompt_length"], len(secret_prompt))
+        self.assertNotIn("prompt_text", payload2)
+
 
 class TestHookApplyParity(Base):
-    """Legacy v1 handle_hook semantics, preserved exactly by the collector."""
+    """Legacy v1 handle_hook semantics, preserved by the collector. Payloads pass
+    through reduce_payload first, exactly as the real hook->spool->collector pipeline."""
 
     def _apply(self, payload):
+        from cc_usage.hookspool import reduce_payload
         db = fresh_db(self.home)
-        collector.apply_hook_event(db, payload)
+        reduced = reduce_payload(payload)
+        reduced["env_snapshot"] = payload.get("env_snapshot") or {}  # enqueue adds this
+        collector.apply_hook_event(db, reduced)
         db.commit()
         return db
 
@@ -104,6 +127,20 @@ class TestHookApplyParity(Base):
         self.assertEqual(ce["jira_ticket"], "RUS-6225")
         pc = db.execute("SELECT * FROM prompt_context").fetchone()
         self.assertEqual(pc["jira_ticket"], "RUS-6225")
+
+    def test_hook_event_replay_is_idempotent(self):
+        """Crash between DB commit and state advance must not duplicate rows (P2-4)."""
+        from cc_usage.hookspool import reduce_payload
+        db = fresh_db(self.home)
+        p = reduce_payload({"hook_event_name": "UserPromptExpansion", "session_id": "sD",
+                            "prompt_id": "p9", "command_name": "create-pr",
+                            "command_args": "RUS-1", "cwd": "/tmp",
+                            "captured_at": "2026-10-24T10:02:00-07:00", "env_snapshot": {}})
+        for _ in range(3):  # replayed 3x (state-loss simulation)
+            collector.apply_hook_event(db, p)
+        db.commit()
+        n = db.execute("SELECT COUNT(*) c FROM command_events").fetchone()["c"]
+        self.assertEqual(n, 1)
 
     def test_session_end(self):
         self._apply({"hook_event_name": "SessionStart", "session_id": "sC", "cwd": "/tmp",

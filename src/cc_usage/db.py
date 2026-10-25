@@ -214,7 +214,30 @@ CREATE VIEW IF NOT EXISTS v_request_gaps AS
   WHERE a.source = 'transcript';
 """
 
-MIGRATIONS = [(1, "phase_a_identity", M001)]
+M002 = """
+ALTER TABLE api_requests ADD COLUMN identity_basis TEXT;
+UPDATE api_requests SET identity_basis =
+  CASE WHEN identity_key LIKE 'sur:%' THEN 'surrogate' ELSE 'native' END
+  WHERE identity_basis IS NULL;
+UPDATE api_requests SET identity_basis = 'conflict-resolved'
+  WHERE identity_conflict = 1 AND identity_basis IN ('native', NULL);
+ALTER TABLE command_events ADD COLUMN event_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_command_event_hash ON command_events(event_hash)
+  WHERE event_hash IS NOT NULL;
+ALTER TABLE config_snapshots ADD COLUMN event_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_config_event_hash ON config_snapshots(event_hash)
+  WHERE event_hash IS NOT NULL;
+CREATE TABLE IF NOT EXISTS backfill_state (
+  source_file TEXT PRIMARY KEY,
+  byte_offset INTEGER NOT NULL DEFAULT 0,
+  size INTEGER,
+  mtime REAL,
+  records INTEGER NOT NULL DEFAULT 0,
+  last_ok TEXT
+);
+"""
+
+MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002)]
 
 
 def now_iso():
@@ -241,7 +264,7 @@ def migrate(db):
         row = db.execute("SELECT version FROM schema_migrations WHERE version=?", (version,)).fetchone()
         if row:
             continue
-        db.executescript(sql)
+        db.executescript("BEGIN;" + sql + "COMMIT;")  # atomic per migration (critic P2-3)
         db.execute("INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
                    (version, name, now_iso()))
         applied.append((version, name))

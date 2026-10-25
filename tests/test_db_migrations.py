@@ -79,7 +79,8 @@ class TestMigrationOnCopy(unittest.TestCase):
         migrate(db)
         migrate(db)  # second run applies nothing and must not raise
         row = db.execute("SELECT COUNT(*) c FROM schema_migrations").fetchone()
-        self.assertEqual(row["c"], 1)
+        from cc_usage.db import MIGRATIONS
+        self.assertEqual(row["c"], len(MIGRATIONS))
         db.close()
 
     def test_rollback_preserves_v1_behavior(self):

@@ -97,6 +97,21 @@ def normalize(payload):
     return rows
 
 
+# Attribute allowlist for persisted OTLP attribute maps (critic P2-9): anything not
+# listed is dropped before storage. No prompt/response/API-body content can pass.
+_ATTR_ALLOWLIST = (
+    "event.name", "event.timestamp", "session.id", "prompt.id", "request_id",
+    "client_request_id", "model", "input_tokens", "output_tokens", "cache_read_tokens",
+    "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens",
+    "duration_ms", "cost_usd", "attempt", "status_code", "query_source", "effort",
+    "speed", "skill.name", "agent.name", "message.uuid", "error",
+)
+
+
+def _filtered_attrs(attrs):
+    return {k: v for k, v in (attrs or {}).items() if k in _ATTR_ALLOWLIST}
+
+
 def insert_rows(db, rows):
     """Write normalized rows through the single writer connection."""
     for r in rows:
@@ -108,7 +123,7 @@ def insert_rows(db, rows):
                 (r["session_id"], r["ts"], r["model"], r["input_tokens"], r["output_tokens"],
                  r["cache_read_tokens"], r["cache_creation_tokens"], r["cost_usd"],
                  r["duration_ms"], r["request_id"], r["prompt_id"],
-                 json.dumps(r["attrs"], separators=(",", ":"), default=str)))
+                 json.dumps(_filtered_attrs(r["attrs"]), separators=(",", ":"), default=str)))
         elif r["kind"] == "api_error":
             db.execute(
                 "INSERT INTO provider_events(ts,provider,gateway,session_id,kind,code,detail,"

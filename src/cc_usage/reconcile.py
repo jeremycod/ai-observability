@@ -10,7 +10,7 @@ import os
 import sys
 
 from .db import now_iso
-from .ingest.transcripts import ts_epoch
+from .ingest.transcripts import SUBAGENT_RE, ts_epoch
 
 
 def _identity(rec):
@@ -51,7 +51,7 @@ def recompute_from_files(files):
             if msg.get("model") == "<synthetic>" or rec.get("isApiErrorMessage"):
                 continue  # errors are never model responses
             mid = msg.get("id")
-            side = 1 if "/subagents/" in path.replace("\\", "/") else 0
+            side = 1 if SUBAGENT_RE.search(path.replace("\\", "/")) else 0
             bucket = "sidechain" if side else "main"
 
             def tok(k):
@@ -83,16 +83,18 @@ def _zero():
 
 def db_totals(db, session_id):
     out = {"main": _zero(), "sidechain": _zero()}
-    # Only natively-identified rows participate in the EXACT comparison; surrogate rows
-    # (missing message id) are reported separately as unverifiable (spec §15 A12).
+    # Only natively-identified rows participate in the EXACT comparison (counts AND
+    # token sums); surrogate rows are reported separately as unverifiable (critic P2-6).
     rows = db.execute(
         "SELECT is_sidechain, COUNT(*) n, SUM(input_tokens) i, SUM(output_tokens) o, "
         "SUM(cache_read_tokens) cr, SUM(cache_creation_tokens) cc, "
         "SUM(CASE WHEN identity_key LIKE 'sur:%' THEN 1 ELSE 0 END) sur "
-        "FROM v_model_responses WHERE session_id=? GROUP BY is_sidechain", (session_id,)).fetchall()
+        "FROM v_model_responses WHERE session_id=? "
+        "AND (identity_key IS NULL OR identity_key NOT LIKE 'sur:%') "
+        "GROUP BY is_sidechain", (session_id,)).fetchall()
     for r in rows:
         b = "sidechain" if r["is_sidechain"] else "main"
-        out[b]["responses"] = (r["n"] or 0) - (r["sur"] or 0)
+        out[b]["responses"] = r["n"] or 0
         out[b]["unverifiable"] = r["sur"] or 0
         out[b]["input"] = r["i"] or 0
         out[b]["output"] = r["o"] or 0

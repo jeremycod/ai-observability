@@ -1,10 +1,13 @@
 """Provider identity, model canonicalization, request identity, and config snapshots.
 
 Spec v3.1 §3 (request identity contract) and §4 (four provider dimensions).
-Privacy: config snapshots capture an ALLOWLIST of non-secret env keys only.
+Privacy: config snapshots capture an ALLOWLIST of non-secret env keys only; hook
+payloads are reduced to derived fields (prompt LENGTH + extracted Jira key) before
+anything is persisted — raw prompt/command text never reaches disk (critic P0-1).
 """
 import hashlib
 import os
+import re
 
 # (gateway, host substring, billing provider). Order matters: first match wins.
 GATEWAYS = (
@@ -107,8 +110,23 @@ def identity_key(message_id, session_id, source_file, byte_offset):
 
 def order_key(record_ts, source_file, byte_offset):
     """Deterministic total order for duplicate resolution, valid ACROSS files
-    (byte offsets are file-local and never compared directly — spec §3.1)."""
-    return (record_ts or "", str(source_file), int(byte_offset))
+    (byte offsets are file-local and never compared directly — spec §3.1).
+    record_ts must be an epoch float (see ts_epoch); coerced here so a None/missing
+    timestamp can never mix types and crash ordering (critic P0-2)."""
+    try:
+        ts = float(record_ts) if record_ts is not None else 0.0
+    except (TypeError, ValueError):
+        ts = 0.0
+    return (ts, str(source_file), int(byte_offset))
+
+
+def jira_from(text):
+    """Extract the first Jira-style key (RUS-1234). Shared by hook enqueue (which
+    reduces prompt text to just this key BEFORE persisting anything) and the collector."""
+    if not text:
+        return None
+    m = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", str(text).upper())
+    return m.group(1) if m else None
 
 
 def provider_inferred(model):

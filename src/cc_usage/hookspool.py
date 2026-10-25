@@ -16,14 +16,36 @@ def events_path(data_dir):
     return os.path.join(d, "events.jsonl"), d
 
 
+# Fields persisted from hook payloads. Everything else (notably `prompt` and
+# `command_args` text) is reduced to derived, non-sensitive fields below — raw prompt
+# or command text must never reach disk (spec §11; critic P0-1).
+_PERSIST_FIELDS = ("hook_event_name", "session_id", "prompt_id", "cwd", "source",
+                   "command_name", "command_source", "permission_mode", "version", "model")
+
+
+def reduce_payload(hook_data):
+    """Keep allowlisted fields + derived non-sensitive values only."""
+    data = hook_data or {}
+    out = {k: data.get(k) for k in _PERSIST_FIELDS if data.get(k) is not None}
+    from .identity import jira_from
+    prompt = data.get("prompt")
+    args = data.get("command_args")
+    if prompt is not None:
+        out["prompt_length"] = len(str(prompt))
+        out["prompt_jira"] = jira_from(prompt)
+    if args is not None:
+        out["command_args_jira"] = jira_from(args)
+    return out
+
+
 def enqueue(data_dir, hook_data):
-    """Serialize a hook payload + allowlisted env snapshot. Never raises to the caller
-    beyond returning False; must stay <~1 ms and must never block Claude Code."""
+    """Serialize a REDUCED hook payload + allowlisted env snapshot. Never raises to the
+    caller; must stay <~1 ms and must never block Claude Code."""
     try:
         path, d = events_path(data_dir)
         os.makedirs(d, exist_ok=True)
         payload = {"captured_at": now_iso()}
-        payload.update(hook_data or {})
+        payload.update(reduce_payload(hook_data))
         payload["env_snapshot"] = config_snapshot_from_env()
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, separators=(",", ":"), default=str) + "\n")

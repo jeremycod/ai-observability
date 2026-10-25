@@ -71,6 +71,8 @@ def build_parser():
     bf.add_argument("--projects-dir", default=str(PROJECTS_DIR))
     rec = sp.add_parser("reconcile", help="recompute a session's totals from raw transcripts")
     rec.add_argument("session")
+    sp.add_parser("spool", help="explicit spool maintenance (`spool prune` removes "
+                                "replayed payloads; never runs automatically)")
     sp.add_parser("db", help="print database path")
     sp.add_parser("help", help="show command guide")
     return p
@@ -98,6 +100,12 @@ def main(argv=None):
         mod.env_lines(positional[0] if positional else "unknown",
                       positional[1] if len(positional) > 1 else "unknown")
         return 0
+    if first == "spool":
+        if len(argv) > 1 and argv[1] == "prune":
+            from .collector import spool_prune
+            return spool_prune()
+        print("usage: cc-usage spool prune")
+        return 1
     if first in LEGACY_COMMANDS:
         return _run_legacy(argv)
 
@@ -115,21 +123,20 @@ def main(argv=None):
         from .doctor import run as doctor_run
         return doctor_run()
     if cmd == "ingest":
-        db = connect(DB_PATH)
-        migrate(db)
-        touched = _sweep(db, args.projects_dir)
-        print("ingest: %d files had new records" % touched)
-        db.close()
+        # CLI never writes SQLite directly — a request marker is consumed by the
+        # collector's sweeper (single-writer contract, spec §11; critic P1-2).
+        from .collector import submit_request
+        submit_request("ingest")
+        print("ingest requested (processed by the collector's next sweep)")
         return 0
     if cmd == "backfill":
         start = args.since or (dt.datetime.now(dt.timezone.utc)
                                - dt.timedelta(days=int(args.days or 30))).isoformat()
         end = args.until
-        db = connect(DB_PATH)
-        migrate(db)
-        touched = _sweep(db, args.projects_dir, ts_window=(start, end))
-        print("backfill window %s..%s: %d files had in-window records" % (start, end or "now", touched))
-        db.close()
+        from .collector import submit_request
+        submit_request("backfill", ts_window=(start, end))
+        print("backfill requested window %s..%s (uses separate backfill offsets; "
+              "processed by the collector's next sweep)" % (start, end or "now"))
         return 0
     if cmd == "reconcile":
         from .reconcile import reconcile_session
@@ -137,6 +144,9 @@ def main(argv=None):
         code = reconcile_session(db, args.session)
         db.close()
         return code
+    if cmd == "spool":
+        from .collector import spool_prune
+        return spool_prune()
     if cmd == "db":
         print(DB_PATH)
         return 0

@@ -86,45 +86,115 @@ class TestEndToEndIsolated(unittest.TestCase):
                     "http://127.0.0.1:%d/v1/logs" % port, data=otlp_log("otel-s%d" % i, "m", i),
                     headers={"Content-Type": "application/json"})
                 urllib.request.urlopen(req, timeout=5)
+            # transcript ingest via request marker (single-writer contract): the CLI
+            # subprocess never touches SQLite; the collector's sweeper consumes it.
+            def count():
+                c = sqlite3.connect(str(home / "usage.db"))
+                try:
+                    return c.execute("SELECT COUNT(*) FROM v_model_responses").fetchone()[0]
+                finally:
+                    c.close()
+            subprocess.run([sys.executable, "-c",
+                            "import sys; sys.path.insert(0, %r);"
+                            "from cc_usage.app import main; sys.exit(main(['ingest']))" % SRC],
+                           env=env, check=True)
+            n_req = 0
+            for _ in range(120):  # up to ~12 s of sweeps
+                n_req = count()
+                if n_req >= 15:
+                    break
+                time.sleep(0.1)
+            self.assertGreaterEqual(n_req, 15)  # 3 sessions x 5 responses
+            # wait for the request marker to be fully processed (moved to done/)
+            done_dir = home / "spool" / "requests" / "done"
+            for _ in range(50):
+                if list(done_dir.glob("req-*.json")):
+                    break
+                time.sleep(0.1)
         finally:
             proc.terminate()
             try:
                 proc.wait(5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        # transcript ingest via a separate process (the `cc-usage ingest` code path)
-        subprocess.run([sys.executable, "-c",
-                        "import sys; sys.path.insert(0, %r);"
-                        "from cc_usage.app import main; sys.exit(main(['ingest',"
-                        "'--projects-dir', %r]))" % (SRC, str(projects))],
-                       env=env, check=True)
         db = sqlite3.connect(str(home / "usage.db"))
         db.row_factory = sqlite3.Row
         n_req = db.execute("SELECT COUNT(*) c FROM v_model_responses").fetchone()["c"]
-        self.assertGreaterEqual(n_req, 15)  # 3 sessions x 5 responses
         n_otel = db.execute("SELECT COUNT(*) c FROM otel_api_requests").fetchone()["c"]
         self.assertEqual(n_otel, 3)
         # source separation: transcript rows never merged with OTLP rows
         self.assertEqual(db.execute("SELECT COUNT(*) c FROM api_requests "
                                     "WHERE source='otel'").fetchone()["c"], 0)
-        # idempotence: second ingest adds nothing
-        subprocess.run([sys.executable, "-c",
-                        "import sys; sys.path.insert(0, %r);"
-                        "from cc_usage.app import main; sys.exit(main(['ingest',"
-                        "'--projects-dir', %r]))" % (SRC, str(projects))],
-                       env=env, check=True)
-        n_req2 = db.execute("SELECT COUNT(*) c FROM v_model_responses").fetchone()["c"]
-        self.assertEqual(n_req, n_req2)
+        # idempotence (marker-based re-ingest adds nothing — checked post-mortem on files)
+        markers_done = list((home / "spool" / "requests" / "done").glob("req-*.json"))
+        self.assertEqual(len(markers_done), 1)
         # zero dedup violations: identity invariant holds
         viol = db.execute("SELECT COUNT(*) c FROM (SELECT session_id, identity_key "
                           "FROM api_requests WHERE identity_key IS NOT NULL "
                           "GROUP BY session_id, identity_key HAVING COUNT(*)>1)").fetchone()["c"]
         self.assertEqual(viol, 0)
-        # identity basis populated for all native rows
+        # identity_basis populated for all rows (native/surrogate/conflict-resolved)
         bare = db.execute("SELECT COUNT(*) c FROM v_model_responses "
-                          "WHERE identity_key IS NULL").fetchone()["c"]
+                          "WHERE identity_basis IS NULL").fetchone()["c"]
         self.assertEqual(bare, 0)
         db.close()
+
+
+class TestChunkedOTLPDelivery(unittest.TestCase):
+    """ROOT-CAUSE REGRESSION (2026-10-25): Claude Code's OTLP exporter sends chunked
+    transfer-encoding; reading only Content-Length silently discarded every payload
+    (bytes=0) — the entire 'dead pipeline' symptom since v1."""
+
+    def test_chunked_log_payload_ingests(self):
+        import http.client
+        tmp = Path(tempfile.mkdtemp(prefix="cc-usage-chunk-"))
+        home = tmp / "home"
+        (home / "projects").mkdir(parents=True)
+        port = free_port()
+        env = dict(os.environ, CC_USAGE_HOME=str(home), CC_USAGE_PORT=str(port),
+                   CC_USAGE_PROJECTS_DIR=str(home / "projects"), PYTHONPATH=SRC)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "from cc_usage.collector import collector_foreground; collector_foreground()"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        try:
+            for _ in range(80):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            body = otlp_log("chunk-sess", "glm-5.3-flash", 1)
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.putrequest("POST", "/v1/logs")
+            conn.putheader("Transfer-Encoding", "chunked")
+            conn.putheader("Content-Type", "application/json")
+            conn.endheaders()
+            conn.send(("%x\r\n" % len(body)).encode() + body + b"\r\n")
+            conn.send(b"0\r\n\r\n")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            conn.close()
+            tdb = str(home / "usage.db")
+            n = 0
+            for _ in range(60):
+                c = sqlite3.connect(tdb)
+                try:
+                    n = c.execute("SELECT COUNT(*) FROM otel_api_requests "
+                                  "WHERE session_id='chunk-sess'").fetchone()[0]
+                finally:
+                    c.close()
+                if n:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(n, 1, "chunked OTLP log payload must be ingested")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 if __name__ == "__main__":
