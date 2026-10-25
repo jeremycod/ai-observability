@@ -45,10 +45,13 @@ def self_check():
                             start_new_session=True)
     ok, detail = False, "no response"
     try:
-        for _ in range(60):
+        for _ in range(100):  # generous: the child may be slow to bind under load
             if port_open(port):
                 break
-            time.sleep(0.05)
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                break  # child died; fall through to the failure detail
+        tdb = os.path.join(tmp, "usage.db")
         payload = json.dumps({"resourceLogs": [{"resource": {"attributes": []},
             "scopeLogs": [{"scope": {"name": "doctor"}, "logRecords": [{
                 "timeUnixNano": "1761370000000000000", "severityText": "INFO",
@@ -65,8 +68,8 @@ def self_check():
         req = urllib.request.Request("http://127.0.0.1:%d/v1/logs" % port, data=payload,
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
-        tdb = os.path.join(tmp, "usage.db")
-        for _ in range(60):
+        for _ in range(100):  # generous: ingestion may lag under load
+            tdb = os.path.join(tmp, "usage.db")
             try:
                 con = sqlite3.connect(tdb, timeout=2)
                 n = con.execute("SELECT COUNT(*) FROM otel_api_requests "
