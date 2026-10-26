@@ -51,10 +51,11 @@ SQL_CMDS = ("SELECT ts, command_name, prompt_id, jira_ticket FROM command_events
 SQL_DEL_PHASES = "DELETE FROM workflow_phases WHERE session_id=?"
 SQL_DEL_TRANS = "DELETE FROM phase_transitions WHERE session_id=?"
 SQL_INS_PHASE = ("INSERT INTO workflow_phases(lineage_id,session_id,phase,started_at,ended_at,"
-                 "trigger_kind,prompt_id,ticket_keys,pr_number,confidence,basis,evidence_json) "
-                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+                 "trigger_kind,prompt_id,ticket_keys,pr_number,confidence,basis,evidence_json,"
+                 "device_id) "
+                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
 SQL_INS_TRANS = ("INSERT INTO phase_transitions(lineage_id,session_id,from_phase,to_phase,at,"
-                 "trigger_kind,evidence_json) VALUES(?,?,?,?,?,?,?)")
+                 "trigger_kind,evidence_json,device_id) VALUES(?,?,?,?,?,?,?,?)")
 SQL_UNSTAMP = ("UPDATE api_requests SET phase_id=NULL, prompt_uuid=NULL "
                "WHERE session_id=? AND is_sidechain=0")
 SQL_UNSTAMP_SIDEC = ("UPDATE api_requests SET phase_id=NULL "
@@ -62,9 +63,9 @@ SQL_UNSTAMP_SIDEC = ("UPDATE api_requests SET phase_id=NULL "
 SQL_STAMP = "UPDATE api_requests SET phase_id=?, prompt_uuid=COALESCE(?, prompt_uuid), " \
             "attribution_skill=COALESCE(attribution_skill, ?) WHERE id=?"
 SQL_LINEAGE_UPSERT = ("INSERT INTO work_lineages(lineage_id,primary_ticket,created_at,"
-                      "session_ids,continuation_of,note) VALUES(?,?,?,?,?,?) "
+                      "session_ids,continuation_of,note,device_id) VALUES(?,?,?,?,?,?,?) "
                       "ON CONFLICT(lineage_id) DO UPDATE SET primary_ticket=excluded.primary_ticket,"
-                      "session_ids=excluded.session_ids")
+                      "session_ids=excluded.session_ids,device_id=excluded.device_id")
 
 
 def phase_for_command(cmd):
@@ -143,7 +144,7 @@ def nearest_prompt(order, nodes, ts_e):
 
 def build_session(db, session_id):
     """Rebuild phase spans + prompt linkage for one session. Returns span count."""
-    sess = db.execute("SELECT cwd, git_branch, started_at, ended_at FROM sessions "
+    sess = db.execute("SELECT cwd, git_branch, started_at, ended_at, device_id FROM sessions "
                       "WHERE session_id=?", (session_id,)).fetchone()
     resps = db.execute(SQL_RESP, (session_id,)).fetchall()
     if sess is None or not resps:
@@ -255,6 +256,7 @@ def build_session(db, session_id):
 
     # --- materialize (derived data; per-session rebuild is DELETE+INSERT) ---
     lineage_id = lineage_for_session(db, session_id, sess)
+    session_device = sess["device_id"]
     ticket_keys = None
     if sess["git_branch"]:
         m = TICKET_RE.search(sess["git_branch"].upper())
@@ -271,11 +273,12 @@ def build_session(db, session_id):
         cur = db.execute(SQL_INS_PHASE, (
             lineage_id, session_id, ph, _iso(s0), _iso(s1), trig, pid,
             ticket_keys, None, conf, basis,
-            json.dumps({"start_epoch": s0, "end_epoch": s1}, separators=(",", ":")))).lastrowid
+            json.dumps({"start_epoch": s0, "end_epoch": s1}, separators=(",", ":")),
+            session_device)).lastrowid
         phase_ids.append((cur, s0, s1, ph))
         if prev_phase is not None and prev_phase != ph:
             db.execute(SQL_INS_TRANS, (lineage_id, session_id, prev_phase, ph,
-                                       _iso(s0), trig, None))
+                                       _iso(s0), trig, None, session_device))
         prev_phase = ph
 
     # --- stamp responses: innermost enclosing span (sequential spans -> the container) ---
@@ -333,7 +336,7 @@ def lineage_for_session(db, session_id, sess):
         note = "cwd-grouped"
     sib_ids = sorted({r[0] for r in rows} | {session_id})
     db.execute(SQL_LINEAGE_UPSERT, (lineage_id, ticket, now_iso(), json.dumps(sib_ids),
-                                    None, note))
+                                    None, note, sess["device_id"]))
     return lineage_id
 
 

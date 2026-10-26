@@ -31,7 +31,7 @@ def _blended_rates(db, device=None):
               else (" WHERE device_id = ?", [device]))
     rows = db.execute(
         "SELECT provider, model, input_tokens i, output_tokens o, cache_read_tokens cr, "
-        "cache_creation_tokens cc, record_ts ts FROM v_model_responses" + df).fetchall()
+        "cache_creation_tokens cc, record_ts ts FROM v_model_responses" + df, dp).fetchall()
     est_rows = [(r["provider"], r["model"], r["i"] or 0, r["o"] or 0, r["cr"] or 0,
                  r["cc"] or 0, ts_epoch(r["ts"])) for r in rows]
     est, _, _ = cost.estimate_provider_usd(db, est_rows)
@@ -162,7 +162,7 @@ def value_report(db, days=30, device=None):
         "SUM((SELECT COALESCE(SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens"
         "+r.cache_creation_tokens),0) FROM api_requests r WHERE r.phase_id=p.id" + df + ")) tokens "
         "FROM workflow_phases p WHERE p.trigger_kind LIKE 'command:%' "
-        "GROUP BY p.trigger_kind", dp).fetchall()
+        "GROUP BY p.trigger_kind", dp + dp).fetchall()  # df embedded in BOTH subqueries
     at = []
     for a in actions:
         cmd = a["trig"].replace("command:", "")

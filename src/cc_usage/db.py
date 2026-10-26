@@ -395,9 +395,38 @@ CREATE INDEX IF NOT EXISTS ix_sessions_device ON sessions(device_id);
 CREATE INDEX IF NOT EXISTS ix_api_device ON api_requests(device_id);
 """
 
+M007 = """
+-- Phase G fix: derived tables sync as PER-DEVICE snapshots (two laptops pushing must
+-- not clobber each other's phase data on the aggregate).
+ALTER TABLE workflow_phases ADD COLUMN device_id TEXT;
+ALTER TABLE phase_transitions ADD COLUMN device_id TEXT;
+ALTER TABLE work_lineages ADD COLUMN device_id TEXT;
+"""
+
+M008 = """
+-- Phase G fix: phase ids are device-local autoincrements; the receiver reassigns
+-- them on snapshot apply and records the mapping so api_requests.phase_id stamps
+-- can be rewritten per device. Receiver-local table; never synced.
+CREATE TABLE IF NOT EXISTS sync_phase_map (
+  device_id TEXT NOT NULL,
+  sender_id INTEGER NOT NULL,
+  local_id INTEGER NOT NULL,
+  PRIMARY KEY (device_id, sender_id)
+);
+"""
+
+M009 = """
+-- Phase G fix: phase-attribution joins (actions rollup, phase stamping) correlated-
+-- subquery over api_requests.phase_id — without this index each span scan is O(table).
+CREATE INDEX IF NOT EXISTS ix_api_phase ON api_requests(phase_id);
+"""
+
 MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002),
               (3, "phase_b_attribution", M003), (4, "phase_c_correlation", M004),
-              (5, "phase_d_quota_cost", M005), (6, "phase_g_multidevice", M006)]
+              (5, "phase_d_quota_cost", M005), (6, "phase_g_multidevice", M006),
+              (7, "phase_g_device_scoped_snapshots", M007),
+              (8, "phase_g_phase_id_remap", M008),
+              (9, "phase_g_phase_id_index", M009)]
 
 
 def now_iso():

@@ -42,11 +42,17 @@ def _columns(db, table):
 
 
 def ensure_device_backfill(db):
-    """One-time: every pre-sync row was captured on THIS machine."""
+    """One-time: every pre-sync row was captured on THIS machine. Derived tables
+    inherit the device of their session."""
     did = devicemod.device_id()
     for t in ("sessions", "api_requests", "config_snapshots", "pr_contributions",
-              "command_events", "prompt_context"):
+              "command_events", "prompt_context", "api_request_occurrences",
+              "api_errors", "otel_api_requests", "tool_events"):
         db.execute("UPDATE %s SET device_id=? WHERE device_id IS NULL" % t, (did,))
+    for t in ("workflow_phases", "phase_transitions"):
+        db.execute("UPDATE %s SET device_id=(SELECT s.device_id FROM sessions s "
+                   "WHERE s.session_id=%s.session_id) WHERE device_id IS NULL" % (t, t))
+    db.execute("UPDATE work_lineages SET device_id=? WHERE device_id IS NULL", (did,))
     db.commit()
     return did
 
@@ -66,9 +72,14 @@ def _rows_since(db, table, last_id):
             return
 
 
-def _rows_all(db, table, mode):
+def _rows_all(db, table, mode, device=None):
     cols = _columns(db, table)
-    for r in db.execute("SELECT %s FROM %s" % (",".join(cols), table)):
+    q = "SELECT %s FROM %s" % (",".join(cols), table)
+    params = ()
+    if device and "device_id" in cols:
+        q += " WHERE device_id = ?"
+        params = (device,)
+    for r in db.execute(q, params):
         yield table, mode, {c: r[c] for c in cols}
 
 
@@ -98,9 +109,13 @@ def _iter_batches(db, device):
         yield json.dumps({"upsert_done": {"table": table}}) + "\n"
     for table in SNAPSHOT:
         yield json.dumps({"snapshot_begin": {"table": table}}) + "\n"
-        for (t, mode, row) in _rows_all(db, table, "snapshot"):
+        for (t, mode, row) in _rows_all(db, table, "snapshot", device):
+            sender_id = row.get("id")
+            row.pop("id", None)  # ids are device-local; receiver assigns fresh ones
             row["_src_table"] = t
             row["_mode"] = mode
+            if sender_id is not None:
+                row["_sender_id"] = sender_id
             yield json.dumps(row, default=str) + "\n"
         yield json.dumps({"snapshot_end": {"table": table}}) + "\n"
 
@@ -129,21 +144,48 @@ def push(db, url, token, device=None):
     return sent, applied
 
 
-def _apply_line(db, line, applied):
+def _apply_line(db, line, applied, batch_device=None):
     rec = json.loads(line)
-    if "meta" in rec or "watermark" in rec or "upsert_done" in rec:
+    if "meta" in rec:
         return
     if "snapshot_begin" in rec:
         t = rec["snapshot_begin"]["table"]
-        db.execute("DELETE FROM %s" % t)
+        # PER-DEVICE snapshot replace: one laptop's phases must never delete
+        # another laptop's (multi-device merge, spec §17)
+        db.execute("DELETE FROM %s WHERE device_id=?" % t, (batch_device,))
         return
-    if "snapshot_end" in rec or not rec.get("_src_table"):
+    if "snapshot_end" in rec:
+        t = rec["snapshot_end"]["table"]
+        if t == "workflow_phases" and batch_device:
+            # re-stamp this device's response stamps onto receiver-local ids: stale
+            # stamps (previous-push ids) NULL out, then remap via sync_phase_map
+            db.execute("UPDATE api_requests SET phase_id=NULL WHERE device_id=? AND "
+                       "phase_id IS NOT NULL AND phase_id NOT IN "
+                       "(SELECT id FROM workflow_phases)", (batch_device,))
+            db.execute("UPDATE api_requests SET phase_id=(SELECT local_id FROM "
+                       "sync_phase_map WHERE device_id=? AND "
+                       "sender_id=api_requests.phase_id) WHERE device_id=? AND "
+                       "phase_id IS NOT NULL", (batch_device, batch_device))
+        return
+    if not rec.get("_src_table"):
         return
     table = rec["_src_table"]
     mode = rec["_mode"]
     row = {k: v for k, v in rec.items() if not k.startswith("_")}
+    sender_id = rec.get("_sender_id")
+    if table == "work_lineages" and mode == "upsert":
+        _merge_lineage(db, row)
+        applied[table] = applied.get(table, 0) + 1
+        return
     cols = list(row.keys())
     if mode == "snapshot":
+        if table == "workflow_phases":
+            # device-local ids collide across devices; the receiver assigns fresh ids
+            # and records (device, sender_id) -> local_id so response stamps remap
+            cols = [c for c in cols if c != "id"]
+        if not row.get("device_id") and batch_device:
+            row["device_id"] = batch_device
+            cols = list(row.keys())
         sql = "INSERT INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
                                                  ",".join("?" * len(cols)))
     else:
@@ -152,8 +194,42 @@ def _apply_line(db, line, applied):
             if table in WATERMARK else \
             "INSERT OR REPLACE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
                                                           ",".join("?" * len(cols)))
-    db.execute(sql, [row[c] for c in cols])
+    new_id = db.execute(sql, [row[c] for c in cols]).lastrowid
     applied[table] = applied.get(table, 0) + 1
+    if table == "workflow_phases" and sender_id is not None and new_id:
+        db.execute("INSERT OR REPLACE INTO sync_phase_map(device_id,sender_id,local_id) "
+                   "VALUES(?,?,?)", (batch_device, sender_id, new_id))
+    else:
+        sql = "INSERT OR IGNORE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
+                                                           ",".join("?" * len(cols))) \
+            if table in WATERMARK else \
+            "INSERT OR REPLACE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
+                                                          ",".join("?" * len(cols)))
+    db.execute(sql, [row.get(c) for c in cols])
+    applied[table] = applied.get(table, 0) + 1
+
+
+def _merge_lineage(db, row):
+    """work_lineages: SAME ticket lineage exists on every device — merge session_ids
+    (union) instead of replace, so neither laptop's sessions drop out of rollups."""
+    cols = [r[1] for r in db.execute("PRAGMA table_info(work_lineages)")]
+    existing = db.execute("SELECT session_ids FROM work_lineages WHERE lineage_id=?",
+                          (row["lineage_id"],)).fetchone()
+    row = dict(row)
+    if existing:
+        try:
+            ours = set(json.loads(existing["session_ids"] or "[]"))
+        except (ValueError, TypeError):
+            ours = set()
+        try:
+            theirs = set(json.loads(row.get("session_ids") or "[]"))
+        except (ValueError, TypeError):
+            theirs = set()
+        row["session_ids"] = json.dumps(sorted(ours | theirs))
+    for c in cols:
+        row.setdefault(c, None)
+    db.execute("INSERT OR REPLACE INTO work_lineages(%s) VALUES(%s)" % (
+        ",".join(cols), ",".join("?" * len(cols))), [row[c] for c in cols])
 
 
 def make_receiver_handler(db_path, token):
@@ -173,10 +249,14 @@ def make_receiver_handler(db_path, token):
             db = connect(db_path)
             migrate(db)
             applied = {}
+            batch_device = None
             try:
                 for line in raw.decode("utf-8").splitlines():
                     if line.strip():
-                        _apply_line(db, line, applied)
+                        first = json.loads(line)
+                        if "meta" in first:
+                            batch_device = first["meta"].get("device")
+                        _apply_line(db, line, applied, batch_device)
                 db.commit()
             except Exception as e:  # noqa: BLE001 — batch fails loud, connection kept
                 db.rollback()

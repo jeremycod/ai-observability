@@ -264,7 +264,7 @@ def apply_timeline_refinements(db, session_ids=None):
         t_review = ts_epoch(first_review)
         spans = db.execute(
             "SELECT id, session_id, started_at, ended_at, trigger_kind, prompt_id, "
-            "ticket_keys, evidence_json FROM workflow_phases "
+            "ticket_keys, evidence_json, device_id FROM workflow_phases "
             "WHERE phase='pr_creation' AND started_at IS NOT NULL").fetchall()
         for s in spans:
             if session_ids and s["session_id"] not in session_ids:
@@ -289,13 +289,13 @@ def _split_phase(db, span_row, t_split):
         _iso(t_split), span_row["trigger_kind"], span_row["prompt_id"],
         span_row["ticket_keys"], None, "high", "command",
         json.dumps({"start_epoch": ev.get("start_epoch"), "end_epoch": t_split},
-                   separators=(",", ":")))).lastrowid
+                   separators=(",", ":")), span_row["device_id"])).lastrowid
     tail = db.execute(SQL_INS_PHASE, (
         None, span_row["session_id"], "revision", _iso(t_split), span_row["ended_at"],
         "post_pr_timeline", span_row["prompt_id"], span_row["ticket_keys"], None,
         "medium", "post_pr_timeline",
         json.dumps({"start_epoch": t_split, "end_epoch": ev.get("end_epoch")},
-                   separators=(",", ":")))).lastrowid
+                   separators=(",", ":")), span_row["device_id"])).lastrowid
     rows = db.execute(
         "SELECT id, record_ts FROM api_requests WHERE session_id=? AND phase_id=? "
         "AND is_sidechain=0", (span_row["session_id"], span_row["id"])).fetchall()

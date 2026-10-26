@@ -166,3 +166,143 @@ import time  # noqa: E402
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTwoDeviceSnapshots(Base):
+    def test_second_device_push_does_not_clobber_first(self):
+        """Multi-device merge regression: A's phases must survive B's snapshot push,
+        and lineage session lists must UNION, not replace. Receiver runs in-process
+        (subprocess receivers drift with env; same HTTP surface either way)."""
+        import http.server
+        import threading
+        agg_db = str(self.home / "aggregate.db")
+        port = free_port()
+        httpd = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", port), sync.make_receiver_handler(agg_db, ""))
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        url = "http://127.0.0.1:%d" % port
+        try:
+            from cc_usage.db import connect as _c, migrate as _m
+            from cc_usage.attribution import workflow as wf
+            dbs = {}
+            for sid, launcher, dev in (("sA", "claude-glm", "dev-A"),
+                                       ("sB", "claude-deepseek", "dev-B")):
+                h = Path(tempfile.mkdtemp(prefix=dev))
+                os.environ["CC_USAGE_HOME"] = str(h)
+                d = _c(h / "usage.db"); _m(d)
+                d.execute("INSERT INTO sessions(session_id,launcher,git_branch,started_at,"
+                          "device_id) VALUES(?,?,?,?,?)",
+                          (sid, launcher, "jeremycod/RUS-5",
+                           "2026-10-24T10:00:00Z" if sid == "sA" else
+                           "2026-10-24T11:00:00Z", dev))
+                f = write_transcript(h / "s" / (sid + ".jsonl"),
+                                     [assistant(sid, "m1", "2026-10-24T%02d:01:00Z" % (10 if sid == "sA" else 11))])
+                ingest_file(d, f)
+                wf.build_session(d, sid)
+                d.commit()
+                dbs[dev] = d
+            sync.push(dbs["dev-A"], url, "", device="dev-A")
+            sync.push(dbs["dev-B"], url, "", device="dev-B")
+            agg = sqlite3.connect(agg_db)
+            agg.row_factory = sqlite3.Row
+            devs = {r[0] for r in agg.execute(
+                "SELECT DISTINCT device_id FROM workflow_phases").fetchall()}
+            self.assertEqual(devs, {"dev-A", "dev-B"},
+                             "B's snapshot push must not delete A's phases")
+            lin = agg.execute("SELECT session_ids FROM work_lineages WHERE "
+                              "primary_ticket='RUS-5'").fetchone()
+            ids = set(json.loads(lin["session_ids"]))
+            self.assertEqual(ids, {"sA", "sB"}, "lineage session_ids must union")
+            # A re-pushes: still no clobber
+            sync.push(dbs["dev-A"], url, "", device="dev-A")
+            devs2 = {r[0] for r in agg.execute(
+                "SELECT DISTINCT device_id FROM workflow_phases").fetchall()}
+            self.assertEqual(devs2, {"dev-A", "dev-B"})
+            agg.close()
+        finally:
+            httpd.shutdown()
+
+
+import time  # noqa: E402
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestTwoDeviceSnapshots(Base):
+    def test_second_device_push_does_not_clobber_first(self):
+        """Multi-device merge regression: A's phases must survive B's snapshot push,
+        and lineage session lists must UNION, not replace."""
+        agg_db = str(self.home / "aggregate.db")
+        port = free_port()
+        env = dict(os.environ, CC_USAGE_SYNC_DB=agg_db,
+                   CC_USAGE_SYNC_TOKEN="", PYTHONPATH=SRC)
+        procs = []
+        try:
+            procs.append(subprocess.Popen(
+                [sys.executable, "-c",
+                 "from cc_usage.sync import serve_sync; serve_sync(port=%d, db_path=%r)"
+                 % (port, agg_db)],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True))
+            for _ in range(100):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            url = "http://127.0.0.1:%d" % port
+            # device A: one session + phases
+            hA = Path(tempfile.mkdtemp(prefix="devA-"))
+            os.environ["CC_USAGE_HOME"] = str(hA)
+            from cc_usage.db import connect as _c, migrate as _m
+            dbA = _c(hA / "usage.db"); _m(dbA)
+            dbA.execute("INSERT INTO sessions(session_id,launcher,git_branch,started_at,"
+                        "device_id) VALUES('sA','claude-glm','jeremycod/RUS-5',"
+                        "'2026-10-24T10:00:00Z','dev-A')")
+            dbA.execute("INSERT INTO api_requests(session_id,ts,source,identity_key,"
+                        "record_ts,is_sidechain,device_id) VALUES('sA',"
+                        "'2026-10-24T10:01:00Z','transcript','mid-a1',"
+                        "'2026-10-24T10:01:00Z',0,'dev-A')")
+            from cc_usage.attribution import workflow as wf
+            wf.build_session(dbA, "sA")
+            dbA.commit()
+            sync.push(dbA, url, "", device="dev-A")
+            # device B: different session + phases (same lineage ticket)
+            hB = Path(tempfile.mkdtemp(prefix="devB-"))
+            os.environ["CC_USAGE_HOME"] = str(hB)
+            dbB = _c(hB / "usage.db"); _m(dbB)
+            dbB.execute("INSERT INTO sessions(session_id,launcher,git_branch,started_at,"
+                        "device_id) VALUES('sB','claude-deepseek','jeremycod/RUS-5',"
+                        "'2026-10-24T11:00:00Z','dev-B')")
+            dbB.execute("INSERT INTO api_requests(session_id,ts,source,identity_key,"
+                        "record_ts,is_sidechain,device_id) VALUES('sB',"
+                        "'2026-10-24T11:01:00Z','transcript','mid-b1',"
+                        "'2026-10-24T11:01:00Z',0,'dev-B')")
+            wf.build_session(dbB, "sB")
+            dbB.commit()
+            sync.push(dbB, url, "", device="dev-B")
+            agg = sqlite3.connect(agg_db)
+            agg.row_factory = sqlite3.Row
+            devs = {r[0] for r in agg.execute(
+                "SELECT DISTINCT device_id FROM workflow_phases").fetchall()}
+            self.assertEqual(devs, {"dev-A", "dev-B"},
+                             "B's snapshot push must not delete A's phases")
+            lin = agg.execute("SELECT session_ids FROM work_lineages WHERE "
+                              "primary_ticket='RUS-5'").fetchone()
+            ids = set(json.loads(lin["session_ids"]))
+            self.assertEqual(ids, {"sA", "sB"}, "lineage session_ids must union")
+            # A re-pushes: still no clobber
+            sync.push(dbA, url, "", device="dev-A")
+            devs2 = {r[0] for r in agg.execute(
+                "SELECT DISTINCT device_id FROM workflow_phases").fetchall()}
+            self.assertEqual(devs2, {"dev-A", "dev-B"})
+            agg.close()
+        finally:
+            for pr in procs:
+                pr.terminate()
+                try:
+                    pr.wait(5)
+                except subprocess.TimeoutExpired:
+                    pr.kill()
