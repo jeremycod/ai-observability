@@ -92,6 +92,9 @@ def build_parser():
     q.add_argument("file", nargs="?", default=None)
     cst = sp.add_parser("cost", help="four-measure cost report (estimates labeled per §9)")
     cst.add_argument("--days", type=int, default=30)
+    cmp_ = sp.add_parser("compare", help="provider comparison methodology (§13)")
+    cmp_.add_argument("--days", type=int, default=90)
+    vld = sp.add_parser("validate", help="reconcile validation datasets #1-#5 (§14)")
     dash = sp.add_parser("dashboard", help="local web dashboard on 127.0.0.1 (read-only)")
     dash.add_argument("--port", type=int, default=4399)
     dash.add_argument("--db", default=None)
@@ -319,6 +322,20 @@ def main(argv=None):
                 pass
         db.close()
         return 0
+    if cmd == "compare":
+        from . import compare
+        db = connect(DB_PATH, timeout=30)
+        migrate(db)
+        print(compare.report(db, days=args.days))
+        db.close()
+        return 0
+    if cmd == "validate":
+        from . import validate
+        db = connect(DB_PATH, timeout=60)
+        migrate(db)
+        code = validate.validate(db)
+        db.close()
+        return code
     if cmd == "dashboard":
         from .dashboard import server
         return server.run(port=args.port, db_path=args.db, open_browser=args.open)
