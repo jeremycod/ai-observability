@@ -49,8 +49,16 @@ cc-usage pr outcomes --days 90         # provider outcome rollup (shared-bucket 
 cc-usage pr show 1417                  # one PR: reviews, rounds, per-provider contributions
 cc-usage reviews scan                  # critic-artifact severity counts from .claude/reviews
 cc-usage jira import snapshot.json     # Jira lifecycle snapshots (no credentials)
+cc-usage dashboard                     # local web observatory on 127.0.0.1:4399 (read-only)
 cc-usage spool prune                   # EXPLICIT removal of replayed spool payloads (never automatic)
 ```
+
+The dashboard (E) renders: attribution-coverage bars (§12 provenance), provider &
+PR-outcome tables with the shared-bucket rule, workflow-phase split, daily token and
+measured-latency trends, concurrency buckets, the quota panel with shared-window
+captions, and a per-session timeline drilldown (phase spans, subagents, errors).
+It opens **read-only**, localhost-only, with zero dependencies; every derived figure
+carries its basis.
 
 Phase attribution (B): each response is stamped with the workflow phase that encloses it
 (implement / critic_review / revision / pr_creation / merge_gate / investigation /

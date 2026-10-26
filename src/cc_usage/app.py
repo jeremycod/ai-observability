@@ -92,6 +92,10 @@ def build_parser():
     q.add_argument("file", nargs="?", default=None)
     cst = sp.add_parser("cost", help="four-measure cost report (estimates labeled per §9)")
     cst.add_argument("--days", type=int, default=30)
+    dash = sp.add_parser("dashboard", help="local web dashboard on 127.0.0.1 (read-only)")
+    dash.add_argument("--port", type=int, default=4399)
+    dash.add_argument("--db", default=None)
+    dash.add_argument("--open", action="store_true", help="open the browser")
     costp = sp.add_parser("config", help="settings (set/show)")
     costp.add_argument("action", choices=["set", "show"])
     costp.add_argument("key", nargs="?", default=None)
@@ -315,6 +319,9 @@ def main(argv=None):
                 pass
         db.close()
         return 0
+    if cmd == "dashboard":
+        from .dashboard import server
+        return server.run(port=args.port, db_path=args.db, open_browser=args.open)
     if cmd == "spool":
         from .collector import spool_prune
         return spool_prune()
