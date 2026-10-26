@@ -28,6 +28,34 @@ OFFPEAK = {"start": 16, "end": 30 + 24, "discount": 0.5, "note": "16:30-00:30 UT
 PLAN_PROVIDERS = {"zai", "zai-plan"}
 INVOICE_KEY = "zai_invoice_usd"
 
+# GLM-5.3-Flash PAY-PER-TOKEN API list rates (Z.ai announcement, verified 2026-10-25;
+# a transient 50% promo exists and is NOT applied). Used ONLY for the clearly-labeled
+# "list-rate equivalent" measure — NEVER as the plan's actual cost, which is
+# invoice-amortized (spec §9). estimate_provider_usd still skips plan providers.
+GLM_LIST_VERSION = "2025.10-zai-list"
+GLM_LIST = {"input": 0.15, "cache_read": 0.03, "cache_creation": 0.15, "output": 0.50}
+
+
+def glm_list_equivalent(db, days):
+    """What the GLM token volume of the window would cost at Z.ai API list rates.
+    Returns (usd, rate_per_M, tokens_by_kind). Labeled estimate everywhere."""
+    rows = db.execute(
+        "SELECT input_tokens i, output_tokens o, cache_read_tokens cr, "
+        "cache_creation_tokens cc FROM v_model_responses WHERE provider='zai' "
+        "AND record_ts >= datetime('now', ?)", ("-%d days" % days,)).fetchall()
+    mix = {"input": 0, "cache_read": 0, "cache_creation": 0, "output": 0}
+    for r in rows:
+        mix["input"] += r["i"] or 0
+        mix["output"] += r["o"] or 0
+        mix["cache_read"] += r["cr"] or 0
+        mix["cache_creation"] += r["cc"] or 0
+    usd = (mix["input"] * GLM_LIST["input"] + mix["cache_read"] * GLM_LIST["cache_read"]
+           + mix["cache_creation"] * GLM_LIST["cache_creation"]
+           + mix["output"] * GLM_LIST["output"]) / 1e6
+    total = sum(mix.values())
+    rate = (usd / total * 1e6) if total else None
+    return (usd, rate, mix)
+
 SQL_PRICE = ("SELECT unit_price_usd FROM price_table WHERE version=? AND provider=? "
              "AND model=? AND metric=?")
 

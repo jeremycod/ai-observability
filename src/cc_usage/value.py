@@ -116,26 +116,38 @@ def value_report(db, days=30):
         return xs[len(xs) // 2] if xs else None
 
     table = []
+    glm_list_usd, glm_list_rate, _mix = cost.glm_list_equivalent(db, days)
     for p, s in prov_stats.items():
         klines = s["net_lines"] / 1000.0
-        rate = rates.get(p) if rates.get(p) is not None else glm_rate
-        cost_basis = ("estimated API" if p in rates and rates.get(p)
-                      else "amortized allocation" if glm_rate else "no price on file")
-        cost_per_1k = (s["tokens"] / 1e6 * rate / klines) if (rate and klines) else None
-        cost_per_pr = (s["tokens"] / 1e6 * rate / s["prs"]) if (rate and s["prs"]) else None
+        list_rate = glm_list_rate if p in cost.PLAN_PROVIDERS else rates.get(p)
+        list_basis = ("API list-rate equivalent [estimate]" if p in cost.PLAN_PROVIDERS
+                      else "estimated API")
+        cost_per_1k = (s["tokens"] / 1e6 * list_rate / klines) if (list_rate and klines) else None
+        cost_per_pr = (s["tokens"] / 1e6 * list_rate / s["prs"]) if (list_rate and s["prs"]) else None
         tok_per_1k = (s["tokens"] / klines) if klines else None
+        amort_per_1k = amort_per_pr = None
+        if p in cost.PLAN_PROVIDERS and glm_rate:
+            amort_per_1k = round(s["tokens"] / 1e6 * glm_rate / klines, 2) if klines else None
+            amort_per_pr = round(s["tokens"] / 1e6 * glm_rate / s["prs"], 2) if s["prs"] else None
         table.append({
             "provider": p, "merged_prs": s["prs"], "tokens": s["tokens"],
             "net_lines": s["net_lines"],
             "tokens_per_1k_lines": round(tok_per_1k) if tok_per_1k else None,
-            "cost_basis": cost_basis,
+            "cost_basis": list_basis,
             "cost_per_1k_lines": round(cost_per_1k, 2) if cost_per_1k is not None else None,
             "cost_per_pr": round(cost_per_pr, 2) if cost_per_pr is not None else None,
+            "amortized_per_1k_lines": amort_per_1k,
+            "amortized_per_pr": amort_per_pr,
             "wall_h_per_pr_median": _avg(s["wall_hours"]),
             "active_h_per_pr_median": _avg(s["active_hours"]),
             "basis": "solo merged PRs only (%d); lines exclude generated files" % s["prs"],
         })
     out["deliverables"] = table
+    out["glm_list_equivalent"] = {"usd_30d_window": round(glm_list_usd, 2),
+                                  "rate_per_M": round(glm_list_rate, 4) if glm_list_rate else None,
+                                  "version": cost.GLM_LIST_VERSION,
+                                  "note": "what GLM tokens would cost at Z.ai pay-per-token "
+                                          "API list rates — NOT your plan bill"}
     out["shared_multi_provider_prs"] = {"count": len(shared_prs), "samples": shared_prs[:6]}
 
     # ---- per-action burn: one run of each command ----
@@ -175,19 +187,32 @@ def print_report(db, days=30):
         return ("%.1fM" % (n / 1e6)) if n >= 1e6 else (("%.1fK" % (n / 1e3)) if n >= 1e3 else str(int(n)))
     print("A. Tokens & cost per 1,000 delivered lines (solo merged PRs)")
     print("   (tokens = input + cache-read + output; on GLM cache-read is quota, on DS it is ~$0.003/M)")
-    print("%-10s %5s %10s %9s %9s %11s %10s %9s" % (
+    print("%-10s %5s %10s %9s %9s %30s %10s %9s %16s" % (
         "provider", "PRs", "tokens", "net lines", "tok/1kL", "cost basis",
-        "$/1kL", "$/PR"))
+        "$/1kL", "$/PR", "$/1kL amortized"))
     for t in v["deliverables"]:
-        print("%-10s %5d %10s %9d %9s %11s %10s %9s" % (
+        print("%-10s %5d %10s %9d %9s %30s %10s %9s %16s" % (
             t["provider"], t["merged_prs"], "%.1fM" % (t["tokens"] / 1e6),
             t["net_lines"], _hm(t["tokens_per_1k_lines"]), t["cost_basis"],
             ("$%.2f" % t["cost_per_1k_lines"]) if t["cost_per_1k_lines"] is not None else "—",
-            ("$%.2f" % t["cost_per_pr"]) if t["cost_per_pr"] is not None else "—"))
+            ("$%.2f" % t["cost_per_pr"]) if t["cost_per_pr"] is not None else "—",
+            ("$%.2f" % t["amortized_per_1k_lines"]) if t.get("amortized_per_1k_lines")
+            is not None else "—"))
+    gle = v.get("glm_list_equivalent") or {}
+    if gle.get("usd_30d_window") is not None:
+        print("   GLM list-rate equivalent: $%.2f for the window's GLM tokens (blended "
+              "$%s/M) — what they WOULD cost at Z.ai pay-per-token API rates; your plan "
+              "bill is the invoice, not this [estimate; 50%% promo not applied]" % (
+                  gle["usd_30d_window"], gle["rate_per_M"]))
+    if v["rates"].get("glm_invoice_on_file"):
+        print("   amortized column uses your $%s invoice at period grain (allocation, "
+              "never marginal)" % v["rates"]["glm_invoice_on_file"])
+    else:
+        print("   amortized column unlocks with: cc-usage config set zai_invoice_usd <amount>")
     r = v["rates"]
-    print("   rates: deepseek blended $%s/M [estimate]; glm $%s/M [allocation of your "
-          "$%s invoice — marginal cash while windows are open is $0; the real price of "
-          "that is quota exhaustion, see Q2/quota panel]" % (
+    print("   rates: deepseek blended $%s/M [estimate]; glm amortized $%s/M [allocation of "
+          "your $%s invoice — marginal cash while windows are open is $0; the real price "
+          "of that is quota exhaustion, see Q2/quota panel]" % (
               r["deepseek_blended_usd_per_M"], r["glm_amortized_usd_per_M"],
               r["glm_invoice_on_file"]))
     print("   shared multi-provider PRs in window: %d (credit split by token share, "
