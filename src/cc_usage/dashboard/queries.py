@@ -25,10 +25,14 @@ def _since(days):
 
 
 
-def _dev(device):
-    """SQL fragment + params for an optional device filter."""
+def _dev(device, alias=None):
+    """SQL fragment + params for an optional device filter. ALWAYS pass an alias when
+    the query joins more than one table carrying device_id (workflow_phases,
+    work_lineages and api_requests all have it since M007) — unqualified device_id
+    is ambiguous there and 500s (live bug on /api/phases)."""
     if device and device != "all":
-        return (" AND device_id = ?", [device])
+        col = (alias + ".device_id") if alias else "device_id"
+        return (" AND %s = ?" % col, [device])
     return "", []
 
 
@@ -124,7 +128,7 @@ def providers(db, days=DAYS, device=None):
 def phases(db, days=DAYS, ticket=None, device=None):
     _rowfactory(db)
     params = [_since(days)]
-    df, dp = _dev(device)
+    df, dp = _dev(device, "r")
     q = ("SELECT COALESCE(l.primary_ticket,'(no ticket)') ticket, p.phase, "
          "COUNT(r.id) responses, "
          "SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens+r.cache_creation_tokens) tokens "

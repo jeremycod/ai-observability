@@ -10,6 +10,7 @@
   device_id: personal / work / everything.
 - No prompt or assistant text is in any synced table (spec §11 holds).
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -33,8 +34,20 @@ WATERMARK = ["api_requests", "api_errors", "otel_api_requests", "command_events"
 UPSERT = ["sessions", "prompt_context", "pull_requests", "pr_reviews", "pr_revisions",
           "pr_files", "subagent_dispatches", "jira_issues", "quota_windows",
           "critic_findings", "review_artifacts", "work_lineages"]
-SNAPSHOT = ["workflow_phases", "phase_transitions"]
+PHASE_TABLES = ["workflow_phases", "phase_transitions"]  # deterministic per-device ids
 BATCH = 4000
+
+
+def device_num(device):
+    """Stable small int from the device id (< 100000)."""
+    return int(hashlib.sha1(device.encode()).hexdigest()[:8], 16) % 100000
+
+
+def sync_phase_id(device, local_id):
+    """Deterministic globally-unique phase id: device_num * 10^7 + local_id.
+    Stable across pushes -> phases upsert (never renumbered), api_requests.phase_id
+    references stay valid forever, and two devices cannot collide (spec §17)."""
+    return device_num(device) * 10**7 + int(local_id)
 
 
 def _columns(db, table):
@@ -96,6 +109,10 @@ def _iter_batches(db, device):
             continue
         count = 0
         for (t, mode, row, _rid) in _rows_since(db, table, last):
+            if table == "api_requests" and row.get("phase_id") is not None \
+                    and row.get("device_id"):
+                # phase stamps become deterministic sync ids on the aggregate
+                row["phase_id"] = device_num(row["device_id"]) * 10**7 + int(row["phase_id"])
             row["_src_table"] = t
             row["_mode"] = mode
             yield json.dumps(row, default=str) + "\n"
@@ -107,17 +124,21 @@ def _iter_batches(db, device):
             row["_mode"] = mode
             yield json.dumps(row, default=str) + "\n"
         yield json.dumps({"upsert_done": {"table": table}}) + "\n"
-    for table in SNAPSHOT:
-        yield json.dumps({"snapshot_begin": {"table": table}}) + "\n"
-        for (t, mode, row) in _rows_all(db, table, "snapshot", device):
-            sender_id = row.get("id")
-            row.pop("id", None)  # ids are device-local; receiver assigns fresh ones
+    dnum = device_num(device)
+    for table in PHASE_TABLES:
+        # deterministic per-device ids: no renumbering, no remapping, no clobbering
+        kept = []
+        for (t, mode, row) in _rows_all(db, table, "upsert"):
+            if row.get("id") is not None:
+                row["id"] = dnum * 10**7 + int(row["id"])
+            if table == "workflow_phases" and not row.get("device_id"):
+                row["device_id"] = device
+            kept.append(row["id"])
             row["_src_table"] = t
-            row["_mode"] = mode
-            if sender_id is not None:
-                row["_sender_id"] = sender_id
+            row["_mode"] = "upsert"
             yield json.dumps(row, default=str) + "\n"
-        yield json.dumps({"snapshot_end": {"table": table}}) + "\n"
+        yield json.dumps({"phase_done": {"table": table, "device": device,
+                                         "kept": kept}}) + "\n"
 
 
 def push(db, url, token, device=None):
@@ -148,63 +169,37 @@ def _apply_line(db, line, applied, batch_device=None):
     rec = json.loads(line)
     if "meta" in rec:
         return
-    if "snapshot_begin" in rec:
-        t = rec["snapshot_begin"]["table"]
-        # PER-DEVICE snapshot replace: one laptop's phases must never delete
-        # another laptop's (multi-device merge, spec §17)
-        db.execute("DELETE FROM %s WHERE device_id=?" % t, (batch_device,))
-        return
-    if "snapshot_end" in rec:
-        t = rec["snapshot_end"]["table"]
-        if t == "workflow_phases" and batch_device:
-            # re-stamp this device's response stamps onto receiver-local ids: stale
-            # stamps (previous-push ids) NULL out, then remap via sync_phase_map
-            db.execute("UPDATE api_requests SET phase_id=NULL WHERE device_id=? AND "
-                       "phase_id IS NOT NULL AND phase_id NOT IN "
-                       "(SELECT id FROM workflow_phases)", (batch_device,))
-            db.execute("UPDATE api_requests SET phase_id=(SELECT local_id FROM "
-                       "sync_phase_map WHERE device_id=? AND "
-                       "sender_id=api_requests.phase_id) WHERE device_id=? AND "
-                       "phase_id IS NOT NULL", (batch_device, batch_device))
+    if "phase_done" in rec:
+        info = rec["phase_done"]
+        # per-device prune: drop THIS device's stale phases (rebuilds renumber
+        # locally); other devices' rows are untouched
+        t = info["table"]
+        kept = info.get("kept") or [0]
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS _kept_ids (id INTEGER)")
+        db.execute("DELETE FROM _kept_ids")
+        db.executemany("INSERT INTO _kept_ids VALUES(?)", [(i,) for i in kept])
+        db.execute("DELETE FROM %s WHERE device_id=? AND id NOT IN "
+                   "(SELECT id FROM _kept_ids)" % t, (info["device"],))
         return
     if not rec.get("_src_table"):
         return
     table = rec["_src_table"]
     mode = rec["_mode"]
     row = {k: v for k, v in rec.items() if not k.startswith("_")}
-    sender_id = rec.get("_sender_id")
     if table == "work_lineages" and mode == "upsert":
         _merge_lineage(db, row)
         applied[table] = applied.get(table, 0) + 1
         return
     cols = list(row.keys())
-    if mode == "snapshot":
-        if table == "workflow_phases":
-            # device-local ids collide across devices; the receiver assigns fresh ids
-            # and records (device, sender_id) -> local_id so response stamps remap
-            cols = [c for c in cols if c != "id"]
+    if table in ("workflow_phases", "phase_transitions", "work_lineages"):
         if not row.get("device_id") and batch_device:
             row["device_id"] = batch_device
             cols = list(row.keys())
-        sql = "INSERT INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
-                                                 ",".join("?" * len(cols)))
-    else:
-        sql = "INSERT OR IGNORE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
-                                                           ",".join("?" * len(cols))) \
-            if table in WATERMARK else \
-            "INSERT OR REPLACE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
-                                                          ",".join("?" * len(cols)))
-    new_id = db.execute(sql, [row[c] for c in cols]).lastrowid
-    applied[table] = applied.get(table, 0) + 1
-    if table == "workflow_phases" and sender_id is not None and new_id:
-        db.execute("INSERT OR REPLACE INTO sync_phase_map(device_id,sender_id,local_id) "
-                   "VALUES(?,?,?)", (batch_device, sender_id, new_id))
-    else:
-        sql = "INSERT OR IGNORE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
-                                                           ",".join("?" * len(cols))) \
-            if table in WATERMARK else \
-            "INSERT OR REPLACE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
-                                                          ",".join("?" * len(cols)))
+    sql = "INSERT OR IGNORE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
+                                                       ",".join("?" * len(cols))) \
+        if table in WATERMARK else \
+        "INSERT OR REPLACE INTO %s(%s) VALUES(%s)" % (table, ",".join(cols),
+                                                      ",".join("?" * len(cols)))
     db.execute(sql, [row.get(c) for c in cols])
     applied[table] = applied.get(table, 0) + 1
 
