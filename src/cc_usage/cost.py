@@ -36,13 +36,16 @@ GLM_LIST_VERSION = "2025.10-zai-list"
 GLM_LIST = {"input": 0.15, "cache_read": 0.03, "cache_creation": 0.15, "output": 0.50}
 
 
-def glm_list_equivalent(db, days):
+def glm_list_equivalent(db, days, device=None):
     """What the GLM token volume of the window would cost at Z.ai API list rates.
     Returns (usd, rate_per_M, tokens_by_kind). Labeled estimate everywhere."""
+    df, dp = (("", []) if not device or device == "all"
+              else (" AND device_id = ?", [device]))
     rows = db.execute(
         "SELECT input_tokens i, output_tokens o, cache_read_tokens cr, "
         "cache_creation_tokens cc FROM v_model_responses WHERE provider='zai' "
-        "AND record_ts >= datetime('now', ?)", ("-%d days" % days,)).fetchall()
+        "AND record_ts >= datetime('now', ?)" + df,
+        ["-%d days" % days] + dp).fetchall()
     mix = {"input": 0, "cache_read": 0, "cache_creation": 0, "output": 0}
     for r in rows:
         mix["input"] += r["i"] or 0

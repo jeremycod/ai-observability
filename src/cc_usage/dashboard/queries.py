@@ -3,8 +3,17 @@
 may ever join quota_windows to accounting (shared-window rule, §8)."""
 import datetime as dt
 import json
+import sqlite3
 
 from ..ingest.transcripts import ts_epoch
+
+
+def _rowfactory(db):
+    """Queries index rows by name; enforce Row regardless of the caller's connection
+    settings (raw sqlite3.connect in tests/receivers defaults to tuples)."""
+    if not isinstance(db.row_factory, type(sqlite3.Row)):
+        db.row_factory = sqlite3.Row
+    return db
 
 DAYS = 30
 CONCURRENCY_BUCKETS = ((1, 2), (3, 4), (5, 7), (8, 999))
@@ -15,8 +24,25 @@ def _since(days):
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
 
 
-def summary(db, days=DAYS):
+
+def _dev(device):
+    """SQL fragment + params for an optional device filter."""
+    if device and device != "all":
+        return (" AND device_id = ?", [device])
+    return "", []
+
+
+def devices(db):
+    _rowfactory(db)
+    return [r["device_id"] for r in db.execute(
+        "SELECT DISTINCT device_id FROM sessions WHERE device_id IS NOT NULL "
+        "ORDER BY device_id")]
+
+
+def summary(db, days=DAYS, device=None):
+    _rowfactory(db)
     start = _since(days)
+    df, dp = _dev(device)
     row = db.execute(
         "SELECT COUNT(*) responses, COALESCE(SUM(input_tokens),0) i, "
         "COALESCE(SUM(output_tokens),0) o, COALESCE(SUM(cache_read_tokens),0) cr, "
@@ -27,19 +53,21 @@ def summary(db, days=DAYS):
         "SUM(CASE WHEN phase_id IS NOT NULL THEN 1 ELSE 0 END) with_phase, "
         "SUM(CASE WHEN latency_basis='measured_api' THEN 1 ELSE 0 END) measured "
         "FROM (SELECT *, provider AS provider_reported FROM api_requests "
-        "WHERE source='transcript' AND record_ts >= ?)", (start,)).fetchone()
+        "WHERE source='transcript' AND record_ts >= ?" + df + ")",
+        [start] + dp).fetchone()
     total = row["responses"] or 0
     cov = lambda n: round(100.0 * (n or 0) / total, 1) if total else 0.0
     otel = db.execute("SELECT COUNT(*) n, AVG(duration_ms) d FROM otel_api_requests "
-                      "WHERE ts >= ?", (start,)).fetchone()
+                      "WHERE ts >= ?" + df, [start] + dp).fetchone()
     return {
         "window_days": days,
         "responses": total,
         "tokens": {"input": row["i"], "output": row["o"], "cache_read": row["cr"],
                    "cache_creation": row["cc"],
                    "total": row["i"] + row["o"] + row["cr"] + row["cc"]},
-        "sessions": db.execute("SELECT COUNT(*) n FROM sessions WHERE started_at >= ?",
-                               (start,)).fetchone()["n"],
+                "sessions": db.execute("SELECT COUNT(*) n FROM sessions WHERE started_at >= ?"
+                               + df,
+                               [start] + dp).fetchone()["n"],
         "coverage": {  # §12 provenance eras: what fraction carries each attribution
             "provider_identity": cov(row["with_provider"]),
             "prompt_linkage": cov(row["with_prompt"]),
@@ -52,15 +80,17 @@ def summary(db, days=DAYS):
     }
 
 
-def providers(db, days=DAYS):
+def providers(db, days=DAYS, device=None):
+    _rowfactory(db)
     start = _since(days)
+    df, dp = _dev(device)
     rows = db.execute(
         "SELECT COALESCE(NULLIF(launcher,''),'(pre-instrumentation)') launcher, "
         "COALESCE(NULLIF(provider,''),'unknown') provider, COUNT(*) responses, "
         "SUM(input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens) tokens, "
         "SUM(CASE WHEN latency_basis='measured_api' THEN 1 ELSE 0 END) measured "
-        "FROM api_requests WHERE source='transcript' AND record_ts >= ? "
-        "GROUP BY 1,2 ORDER BY tokens DESC", (start,)).fetchall()
+        "FROM api_requests WHERE source='transcript' AND record_ts >= ?" + df +
+        " GROUP BY 1,2 ORDER BY tokens DESC", [start] + dp).fetchall()
     out = []
     for r in rows:
         out.append({"launcher": r["launcher"], "provider": r["provider"],
@@ -72,9 +102,10 @@ def providers(db, days=DAYS):
                      "WHERE created_at >= ? AND ticket_keys != '[]'", (start,)).fetchall()
     buckets = {}
     for pr in prs:
+        dfc, dpc = _dev(device)
         provs = {c["provider"] for c in db.execute(
             "SELECT DISTINCT provider FROM pr_contributions WHERE pr_number=? "
-            "AND provider != 'unknown'", (pr["number"],)).fetchall()}
+            "AND provider != 'unknown'" + dfc, [pr["number"]] + dpc).fetchall()}
         key = "shared" if len(provs) > 1 else (provs.pop() if provs else "none")
         b = buckets.setdefault(key, {"prs": 0, "merged": 0, "rounds": 0})
         b["prs"] += 1
@@ -90,14 +121,17 @@ def providers(db, days=DAYS):
     return out
 
 
-def phases(db, days=DAYS, ticket=None):
+def phases(db, days=DAYS, ticket=None, device=None):
+    _rowfactory(db)
     params = [_since(days)]
+    df, dp = _dev(device)
     q = ("SELECT COALESCE(l.primary_ticket,'(no ticket)') ticket, p.phase, "
          "COUNT(r.id) responses, "
          "SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens+r.cache_creation_tokens) tokens "
          "FROM api_requests r JOIN workflow_phases p ON p.id=r.phase_id "
          "LEFT JOIN work_lineages l ON l.lineage_id=p.lineage_id "
-         "WHERE r.source='transcript' AND r.record_ts >= ?")
+         "WHERE r.source='transcript' AND r.record_ts >= ?" + df)
+    params += dp
     if ticket:
         q += " AND l.primary_ticket=?"
         params.append(ticket)
@@ -110,6 +144,7 @@ def phases(db, days=DAYS, ticket=None):
 
 
 def session_timeline(db, session_id):
+    _rowfactory(db)
     srow = db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
     if not srow:
         return None
@@ -144,11 +179,13 @@ def session_timeline(db, session_id):
     }
 
 
-def concurrency(db, days=DAYS):
+def concurrency(db, days=DAYS, device=None):
+    _rowfactory(db)
     """Hourly overlap counts bucketed 1-2 / 3-4 / 5-7 / 8+ (mission §7)."""
     start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    df, dp = _dev(device)
     rows = db.execute("SELECT session_id, started_at, ended_at FROM sessions "
-                      "WHERE started_at >= ?", (_since(days),)).fetchall()
+                      "WHERE started_at >= ?" + df, [_since(days)] + dp).fetchall()
     intervals = []
     for r in rows:
         s = ts_epoch(r["started_at"])
@@ -177,17 +214,19 @@ def concurrency(db, days=DAYS):
             "basis": "hourly overlap of session intervals; Orca journal join is Phase E+"}
 
 
-def trends(db, days=DAYS):
+def trends(db, days=DAYS, device=None):
+    _rowfactory(db)
+    df, dp = _dev(device)
     rows = db.execute(
         "SELECT substr(record_ts,1,10) day, COALESCE(NULLIF(provider,''),'unknown') provider, "
         "COUNT(*) responses, "
         "SUM(input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens) tokens "
-        "FROM api_requests WHERE source='transcript' AND record_ts >= ? "
-        "GROUP BY 1,2 ORDER BY 1", (_since(days),)).fetchall()
+        "FROM api_requests WHERE source='transcript' AND record_ts >= ?" + df +
+        " GROUP BY 1,2 ORDER BY 1", [_since(days)] + dp).fetchall()
     lat = db.execute(
         "SELECT substr(ts,1,10) day, model, AVG(duration_ms) ms, COUNT(*) n "
-        "FROM otel_api_requests WHERE ts >= ? GROUP BY 1,2 ORDER BY 1",
-        (_since(days),)).fetchall()
+        "FROM otel_api_requests WHERE ts >= ?" + df + " GROUP BY 1,2 ORDER BY 1",
+        [_since(days)] + dp).fetchall()
     return {"daily_tokens": [dict(r) for r in rows],
             "daily_measured_latency": [{"day": r["day"], "model": r["model"],
                                         "avg_ms": round(r["ms"] or 0), "n": r["n"]}
@@ -197,6 +236,7 @@ def trends(db, days=DAYS):
 
 
 def quota(db):
+    _rowfactory(db)
     wins = db.execute("SELECT * FROM quota_windows ORDER BY imported_at DESC LIMIT 12").fetchall()
     evs = db.execute("SELECT ts, kind, code, reset_at FROM provider_events "
                      "WHERE kind LIKE 'quota%' OR kind='rate_limit' "
@@ -207,16 +247,18 @@ def quota(db):
                        "SHARED EVIDENCE (spec §8) — capacity from snapshots only"}
 
 
-def prs(db, days=DAYS):
+def prs(db, days=DAYS, device=None):
+    _rowfactory(db)
     rows = db.execute(
         "SELECT number, title, branch, base_branch, base_pr_number, is_stacked_leaf, state, "
         "merged, merged_at, created_at, review_rounds, net_add, net_del, ticket_keys "
         "FROM pull_requests WHERE created_at >= ? ORDER BY number DESC", (_since(days),)).fetchall()
     out = []
     for r in rows:
+        dfc, dpc = _dev(device)
         provs = {c["provider"] for c in db.execute(
             "SELECT DISTINCT provider FROM pr_contributions WHERE pr_number=? "
-            "AND provider != 'unknown'", (r["number"],)).fetchall()}
+            "AND provider != 'unknown'" + dfc, [r["number"]] + dpc).fetchall()}
         d = dict(r)
         d["providers"] = sorted(provs)
         d["bucket"] = "shared" if len(provs) > 1 else (next(iter(provs), "none"))

@@ -96,6 +96,16 @@ def build_parser():
     cmp_.add_argument("--days", type=int, default=90)
     val = sp.add_parser("value", help="tokens/$/speed per 1k lines and per action (§0 goals)")
     val.add_argument("--days", type=int, default=30)
+    val.add_argument("--device", default="all")
+    sy = sp.add_parser("sync", help="push local data to the staging aggregator")
+    sy.add_argument("action", choices=["push", "status"])
+    sy.add_argument("--url", default=os.environ.get("CC_USAGE_SYNC_URL", ""))
+    sy.add_argument("--token-env", default="CC_USAGE_SYNC_TOKEN")
+    ss = sp.add_parser("serve-sync", help="run the aggregation receiver (staging server)")
+    ss.add_argument("--port", type=int, default=4398)
+    ss.add_argument("--db", default=None)
+    ss.add_argument("--token", default=None)
+    dv = sp.add_parser("device", help="show this machine's device id (and backfill)")
     vld = sp.add_parser("validate", help="reconcile validation datasets #1-#5 (§14)")
     dash = sp.add_parser("dashboard", help="local web dashboard on 127.0.0.1 (read-only)")
     dash.add_argument("--port", type=int, default=4399)
@@ -345,6 +355,47 @@ def main(argv=None):
         code = value.print_report(db, days=args.days)
         db.close()
         return code
+    if cmd == "value":
+        from . import value as _value
+        db = connect(DB_PATH, timeout=30)
+        migrate(db)
+        data = _value.value_report(db, days=args.days, device=args.device)
+        _value.print_report(db, days=args.days)
+        db.close()
+        return 0
+    if cmd == "sync":
+        from . import sync as _sync
+        db = connect(_sync._local_db())
+        migrate(db)
+        if args.action == "status":
+            rows = db.execute("SELECT * FROM sync_state ORDER BY table_name").fetchall()
+            for r in rows:
+                print("%-28s last_id=%d pushed=%s" % (r["table_name"], r["last_id"],
+                                                      r["last_push"] or "never"))
+            if not rows:
+                print("never pushed")
+            db.close()
+            return 0
+        token = os.environ.get(args.token_env, "")
+        if not args.url or not token:
+            print("set CC_USAGE_SYNC_URL and %s (or --url)" % args.token_env)
+            db.close()
+            return 1
+        sent, applied = _sync.push(db, args.url, token)
+        print("pushed %d rows; receiver applied: %s" % (sent, applied))
+        db.close()
+        return 0
+    if cmd == "serve-sync":
+        from . import sync as _sync
+        return _sync.serve_sync(args.port, args.db, args.token)
+    if cmd == "device":
+        from .sync import ensure_device_backfill
+        db = connect(DB_PATH)
+        migrate(db)
+        did = ensure_device_backfill(db)
+        db.close()
+        print(did)
+        return 0
     if cmd == "dashboard":
         from .dashboard import server
         return server.run(port=args.port, db_path=args.db, open_browser=args.open)

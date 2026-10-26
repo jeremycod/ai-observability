@@ -24,6 +24,9 @@ from . import __version__
 from .config import (DATA_DIR, DB_PATH, HOST, LOG_PATH, PID_PATH, PORT, PROJECTS_DIR,
                      SPOOL_MAX_BYTES, SWEEP_INTERVAL)
 from .db import connect, migrate, now_iso
+from .device import device_id as _device_id_fn
+
+DEVICE = _device_id_fn()
 from .hookspool import commit_state, read_events
 from .identity import gateway_from_base_url, jira_from
 from .ingest.otel import insert_rows, normalize
@@ -195,7 +198,7 @@ def _event_hash(payload):
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
-def apply_hook_event(db, payload):
+def apply_hook_event(db, payload, device=None):
     ev = payload.get("hook_event_name")
     sid = payload.get("session_id")
     pid = payload.get("prompt_id")
@@ -204,6 +207,7 @@ def apply_hook_event(db, payload):
     ts = payload.get("captured_at") or now_iso()
     branch = git_branch(cwd)
     ehash = _event_hash(payload)
+    device = device or DEVICE
 
     if ev == "SessionStart":
         launcher = env.get("CC_LAUNCHER", "unknown")
@@ -211,46 +215,47 @@ def apply_hook_event(db, payload):
         model = payload.get("model") or env.get("ANTHROPIC_MODEL") or ""
         db.execute(
             "INSERT INTO sessions(session_id,launcher,provider,model,cwd,git_branch,"
-            "started_at,source) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
-            "launcher=excluded.launcher,provider=excluded.provider,"
+            "started_at,source,device_id) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) "
+            "DO UPDATE SET launcher=excluded.launcher,provider=excluded.provider,"
             "model=COALESCE(NULLIF(excluded.model,''),sessions.model),cwd=excluded.cwd,"
             "git_branch=excluded.git_branch",
-            (sid, launcher, provider, model, cwd, branch, ts, payload.get("source")))
+            (sid, launcher, provider, model, cwd, branch, ts, payload.get("source"), device))
     elif ev == "UserPromptExpansion":
         cmd = payload.get("command_name")
         jira = (payload.get("command_args_jira") or payload.get("prompt_jira")
                 or jira_from(branch))
         db.execute("INSERT OR IGNORE INTO command_events(session_id,prompt_id,ts,command_name,"
-                   "command_args,command_source,jira_ticket,event_hash) VALUES(?,?,?,?,?,?,?,?)",
-                   (sid, pid, ts, cmd, None, payload.get("command_source"), jira, ehash))
+                   "command_args,command_source,jira_ticket,event_hash,device_id) "
+                   "VALUES(?,?,?,?,?,?,?,?,?)",
+                   (sid, pid, ts, cmd, None, payload.get("command_source"), jira, ehash, device))
         if pid:
             db.execute("INSERT OR REPLACE INTO prompt_context(session_id,prompt_id,ts,"
-                       "jira_ticket) VALUES(?,?,?,?)", (sid, pid, ts, jira))
+                       "jira_ticket,device_id) VALUES(?,?,?,?,?)", (sid, pid, ts, jira, device))
     elif ev == "UserPromptSubmit":
         jira = payload.get("prompt_jira") or jira_from(branch)
         if pid:
             db.execute("INSERT OR REPLACE INTO prompt_context(session_id,prompt_id,ts,"
-                       "jira_ticket) VALUES(?,?,?,?)", (sid, pid, ts, jira))
+                       "jira_ticket,device_id) VALUES(?,?,?,?,?)", (sid, pid, ts, jira, device))
     elif ev == "SessionEnd":
         db.execute("UPDATE sessions SET ended_at=? WHERE session_id=?", (ts, sid))
         return  # no config snapshot on session end
-    insert_config_snapshot(db, payload, env, ts, sid, ehash)
+    insert_config_snapshot(db, payload, env, ts, sid, ehash, device)
 
 
-def insert_config_snapshot(db, payload, env, ts, sid, ehash=None):
+def insert_config_snapshot(db, payload, env, ts, sid, ehash=None, device=None):
     gw, base_url = gateway_from_base_url(env.get("ANTHROPIC_BASE_URL"))
     db.execute(
         "INSERT OR IGNORE INTO config_snapshots(session_id,ts,cli_version,launcher,provider,"
         "gateway,base_url,model_requested,effort,compact_window,subagent_model,"
-        "permission_mode,orca_pane_key_present,load_avg,source,event_hash) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "permission_mode,orca_pane_key_present,load_avg,source,event_hash,device_id) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (sid, ts, payload.get("version"), env.get("CC_LAUNCHER"), env.get("CC_PROVIDER"),
          gw, base_url, env.get("ANTHROPIC_MODEL"),
          env.get("CLAUDE_CODE_EFFORT_LEVEL") or env.get("CLAUDE_EFFORT"),
          env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
          payload.get("permission_mode"),
          1 if env.get("orca_pane_key_present") else 0, payload.get("load_avg"),
-         payload.get("hook_event_name"), ehash))
+         payload.get("hook_event_name"), ehash, device or DEVICE))
 
 
 def consume_hook_spool(writer):
@@ -354,6 +359,16 @@ class Sweeper(threading.Thread):
             self.writer.submit(job)
         consume_hook_spool(self.writer)
         consume_requests(self.writer)
+        if os.environ.get("CC_USAGE_SYNC_URL") and os.environ.get("CC_USAGE_SYNC_TOKEN"):
+            def push_job(db):
+                from .sync import push
+                try:
+                    sent, applied = push(db, os.environ["CC_USAGE_SYNC_URL"],
+                                         os.environ["CC_USAGE_SYNC_TOKEN"])
+                    log("auto-push: %d rows, applied %s" % (sent, applied))
+                except Exception as e:  # noqa: BLE001 — sync must never break capture
+                    log("auto-push failed: %s" % e)
+            self.writer.submit(push_job)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +442,8 @@ def collector_foreground(host=HOST, port=PORT):
     OTLP_DONE.mkdir(parents=True, exist_ok=True)
     boot = connect(DB_PATH)
     migrate(boot)
+    from .sync import ensure_device_backfill
+    ensure_device_backfill(boot)
     boot.close()
 
     writer = Writer(DB_PATH)

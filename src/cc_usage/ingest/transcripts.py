@@ -17,15 +17,18 @@ import os
 import re
 
 from ..db import now_iso
+from ..device import device_id as _device_id
 from ..identity import (billing_for, canonical_model, identity_key, order_key,
                         provider_inferred, usage_fp)
 
 SUBAGENT_RE = re.compile(r"/subagents/agent-([A-Za-z0-9_.-]+)\.jsonl$")
+DEVICE = _device_id()
 
 _SQL_OCC = ("INSERT OR IGNORE INTO api_request_occurrences"
             "(session_id,identity_key,source_file,byte_offset,record_ts,"
-            "input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,usage_fp,seen_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+            "input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,usage_fp,"
+            "seen_at,device_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
 _SQL_SEL = ("SELECT id,record_ts,source_file,byte_offset,input_tokens,output_tokens,"
             "cache_read_tokens,cache_creation_tokens,usage_fp,occurrences,first_ts,last_ts "
             "FROM api_requests WHERE session_id=? AND identity_key=?")
@@ -49,8 +52,8 @@ _SQL_INSERT_REQ = (
     "identity_key,identity_basis,source,record_ts,source_file,byte_offset,occurrences,usage_fp,"
     "is_sidechain,parent_session_id,agent_id,agent_type,agent_display_name,spawn_depth,"
     "gateway,billing_provider,model_requested,ctx_variant,provider_inferred,"
-    "latency_basis,first_ts,last_ts) "
-    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    "latency_basis,first_ts,last_ts,device_id) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 _SQL_ERR = ("INSERT OR IGNORE INTO api_errors(session_id,ts,message_id,model_raw,"
             "is_synthetic,error_kind,source,source_file,byte_offset,raw_json)"
             " VALUES(?,?,?,?,?,?,?,?,?,?)")
@@ -186,7 +189,7 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
 
     new_occ = db.execute(_SQL_OCC, (session_id, key, source_file, byte_offset, ts,
                                     tokens[0], tokens[1], tokens[2], tokens[3], fp,
-                                    now_iso())).rowcount
+                                    now_iso(), DEVICE)).rowcount
     if not new_occ:
         return ("response", session_id)  # already accounted; keeps re-ingest idempotent
 
@@ -207,7 +210,7 @@ def process_line(db, line, source_file, byte_offset, ts_window=None):
             sub["agent_id"] if sub else None, sub["agent_type"] if sub else None,
             sub["display_name"] if sub else None, sub["spawn_depth"] if sub else None,
             gw, billing_for(gw) if gw else None, model_req, ctx_variant,
-            provider_inferred(model), "unavailable", ts, ts))
+            provider_inferred(model), "unavailable", ts, ts, DEVICE))
         return ("response", session_id)
 
     if row["usage_fp"] == fp:

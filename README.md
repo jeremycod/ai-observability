@@ -73,6 +73,33 @@ The database lives at `~/.local/share/cc-usage/usage.db`. Data model highlights:
 `otel_api_requests` (OTLP cross-check series incl. measured `duration_ms`),
 `api_request_conflicts` (full duplicate-usage audit trail), `telemetry_loss` (visible gaps).
 
+## Multi-laptop aggregation (Phase G)
+
+Each laptop keeps its full local database; pushes are incremental, token-authed, and
+idempotent to a receiver on your staging server. Every row is tagged with a stable
+`device_id`, so the dashboard and CLI can filter **personal laptop / work laptop /
+everything**.
+
+One-time setup:
+```bash
+# staging server (10.0.0.207):
+openssl rand -hex 32                      # generate a token
+sudo CC_USAGE_SYNC_TOKEN='<token>' ./deploy/staging-install.sh
+
+# each laptop:
+security add-generic-password -a "$USER" -s cc-usage-sync-token -w   # paste token
+export CC_USAGE_SYNC_URL=http://10.0.0.207:4398      # e.g. in ~/.zshrc
+cc-usage device                                      # shows this machine's device id
+cc-usage sync push                                   # initial full push (then incremental)
+```
+
+Ongoing: `cc-usage sync push` whenever you like (watermarks make it incremental), or
+set `CC_USAGE_SYNC_URL` + `CC_USAGE_SYNC_TOKEN` in the environment and the collector
+auto-pushes after every sweep. Point the dashboard at the aggregate:
+`cc-usage dashboard --db /var/lib/cc-usage/aggregate.db` (on staging) and pick the
+device in the header selector — `everything` merges both laptops; the shared-bucket
+and matched-set rules already handle PRs touched from both.
+
 ## Guarantees (spec v3.1)
 
 - No raw prompts, assistant text, API bodies, or secret env values are ever stored.

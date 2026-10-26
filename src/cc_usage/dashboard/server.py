@@ -36,28 +36,31 @@ def make_handler(db_path):
                 if u.path.startswith("/api/"):
                     q = {k: v[0] for k, v in parse_qs(u.query).items()}
                     days = int(q.get("days", 30))
+                    device = q.get("device") or "all"
                     db = self._db()
                     try:
                         m = SESSION_RE.match(u.path)
                         if m:
                             data = queries.session_timeline(db, m.group(1))
                         elif u.path == "/api/summary":
-                            data = queries.summary(db, days)
+                            data = queries.summary(db, days, device)
                         elif u.path == "/api/providers":
-                            data = queries.providers(db, days)
+                            data = queries.providers(db, days, device)
                         elif u.path == "/api/phases":
-                            data = queries.phases(db, days, ticket=q.get("ticket"))
+                            data = queries.phases(db, days, ticket=q.get("ticket"), device=device)
                         elif u.path == "/api/concurrency":
-                            data = queries.concurrency(db, days)
+                            data = queries.concurrency(db, days, device)
                         elif u.path == "/api/trends":
-                            data = queries.trends(db, days)
+                            data = queries.trends(db, days, device)
                         elif u.path == "/api/quota":
                             data = queries.quota(db)
                         elif u.path == "/api/prs":
-                            data = queries.prs(db, days)
+                            data = queries.prs(db, days, device)
                         elif u.path == "/api/value":
                             from .. import value
-                            data = value.value_report(db, days)
+                            data = value.value_report(db, days, device=device)
+                        elif u.path == "/api/devices":
+                            data = queries.devices(db)
                         else:
                             return self._send(404, b'{"error":"unknown endpoint"}',
                                               "application/json")

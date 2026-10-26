@@ -372,9 +372,32 @@ CREATE TABLE IF NOT EXISTS price_table (
 );
 """
 
+M006 = """
+-- Phase G: multi-device sync. device_id tags every captured row so the staging
+-- aggregator can filter personal / work / everything. Backfill to the LOCAL device
+-- happens in device.ensure() (migration must stay machine-agnostic).
+ALTER TABLE sessions ADD COLUMN device_id TEXT;
+ALTER TABLE api_requests ADD COLUMN device_id TEXT;
+ALTER TABLE config_snapshots ADD COLUMN device_id TEXT;
+ALTER TABLE pr_contributions ADD COLUMN device_id TEXT;
+ALTER TABLE command_events ADD COLUMN device_id TEXT;
+ALTER TABLE prompt_context ADD COLUMN device_id TEXT;
+ALTER TABLE api_request_occurrences ADD COLUMN device_id TEXT;
+ALTER TABLE api_errors ADD COLUMN device_id TEXT;
+ALTER TABLE otel_api_requests ADD COLUMN device_id TEXT;
+ALTER TABLE tool_events ADD COLUMN device_id TEXT;
+CREATE TABLE IF NOT EXISTS sync_state (
+  table_name TEXT PRIMARY KEY,
+  last_id INTEGER NOT NULL DEFAULT 0,
+  last_push TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sessions_device ON sessions(device_id);
+CREATE INDEX IF NOT EXISTS ix_api_device ON api_requests(device_id);
+"""
+
 MIGRATIONS = [(1, "phase_a_identity", M001), (2, "phase_a_critic_fixes", M002),
               (3, "phase_b_attribution", M003), (4, "phase_c_correlation", M004),
-              (5, "phase_d_quota_cost", M005)]
+              (5, "phase_d_quota_cost", M005), (6, "phase_g_multidevice", M006)]
 
 
 def now_iso():

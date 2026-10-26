@@ -24,12 +24,14 @@ from .correlate.github import outcomes
 from .ingest.transcripts import ts_epoch
 
 
-def _blended_rates(db):
+def _blended_rates(db, device=None):
     """Provider blended $/M tokens from the actual cost estimate over all rows — used
     to price individual PRs (labeled estimate)."""
+    df, dp = (("", []) if not device or device == "all"
+              else (" WHERE device_id = ?", [device]))
     rows = db.execute(
         "SELECT provider, model, input_tokens i, output_tokens o, cache_read_tokens cr, "
-        "cache_creation_tokens cc, record_ts ts FROM v_model_responses").fetchall()
+        "cache_creation_tokens cc, record_ts ts FROM v_model_responses" + df).fetchall()
     est_rows = [(r["provider"], r["model"], r["i"] or 0, r["o"] or 0, r["cr"] or 0,
                  r["cc"] or 0, ts_epoch(r["ts"])) for r in rows]
     est, _, _ = cost.estimate_provider_usd(db, est_rows)
@@ -60,9 +62,11 @@ def _invoice_rate(db, days):
     return (daily * days) / toks * 1e6, inv
 
 
-def value_report(db, days=30):
+def value_report(db, days=30, device=None):
     since = "datetime('now', '-%d days')" % days
-    rates, api_est_total = _blended_rates(db)
+    df, dp = (("", []) if not device or device == "all"
+              else (" AND device_id = ?", [device]))
+    rates, api_est_total = _blended_rates(db, device)
     glm_rate, invoice = _invoice_rate(db, days)
     out = {"window_days": days, "rates": {
         "deepseek_blended_usd_per_M": round(rates.get("deepseek"), 4) if rates.get("deepseek") else None,
@@ -81,8 +85,8 @@ def value_report(db, days=30):
     for pr in prs:
         contrib = db.execute(
             "SELECT provider, SUM(tokens) tok, MIN(first_ts) f, MAX(last_ts) l "
-            "FROM pr_contributions WHERE pr_number=? GROUP BY provider",
-            (pr["number"],)).fetchall()
+            "FROM pr_contributions WHERE pr_number=?" + df + " GROUP BY provider",
+            [pr["number"]] + dp).fetchall()
         provs = {c["provider"] for c in contrib if c["provider"] not in ("unknown", None)}
         if len(provs) > 1:
             shares = {c["provider"]: (c["tok"] or 0) for c in contrib}
@@ -116,7 +120,7 @@ def value_report(db, days=30):
         return xs[len(xs) // 2] if xs else None
 
     table = []
-    glm_list_usd, glm_list_rate, _mix = cost.glm_list_equivalent(db, days)
+    glm_list_usd, glm_list_rate, _mix = cost.glm_list_equivalent(db, days, device)
     for p, s in prov_stats.items():
         klines = s["net_lines"] / 1000.0
         list_rate = glm_list_rate if p in cost.PLAN_PROVIDERS else rates.get(p)
@@ -154,11 +158,11 @@ def value_report(db, days=30):
     actions = db.execute(
         "SELECT p.trigger_kind trig, COUNT(*) spans, "
         "COUNT(DISTINCT p.session_id) sessions, "
-        "SUM((SELECT COUNT(*) FROM api_requests r WHERE r.phase_id=p.id)) responses, "
+        "SUM((SELECT COUNT(*) FROM api_requests r WHERE r.phase_id=p.id" + df + ")) responses, "
         "SUM((SELECT COALESCE(SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens"
-        "+r.cache_creation_tokens),0) FROM api_requests r WHERE r.phase_id=p.id)) tokens "
+        "+r.cache_creation_tokens),0) FROM api_requests r WHERE r.phase_id=p.id" + df + ")) tokens "
         "FROM workflow_phases p WHERE p.trigger_kind LIKE 'command:%' "
-        "GROUP BY p.trigger_kind").fetchall()
+        "GROUP BY p.trigger_kind", dp).fetchall()
     at = []
     for a in actions:
         cmd = a["trig"].replace("command:", "")
