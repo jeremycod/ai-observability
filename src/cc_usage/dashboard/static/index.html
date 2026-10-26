@@ -209,13 +209,14 @@ async function load() {
     const v = await api("value", days, device);
     const dl = v.deliverables || [];
     $("value").innerHTML = table(
-      ["provider","merged PRs","tokens","net lines","tokens/1kL","cost basis","$/1kL (list/est)","$/PR","$/1kL amortized","wall h/PR (med)","active h/PR (med)"],
-      dl.map(t => [t.provider, t.merged_prs, fmt(t.tokens), fmt(t.net_lines),
-        t.tokens_per_1k_lines ? fmt(t.tokens_per_1k_lines) : "—", t.cost_basis,
+      ["provider","solo PRs","shared PRs","tokens","net lines","tokens/1kL","tokens/PR","cost basis","$/1kL (list/est)","$/PR","$/1kL amortized"],
+      dl.map(t => [t.provider, t.solo_merged_prs, t.shared_prs, fmt(t.tokens), fmt(t.net_lines),
+        t.tokens_per_1k_lines ? fmt(t.tokens_per_1k_lines) : "—",
+        t.tokens_per_pr ? fmt(t.tokens_per_pr) : "—", t.cost_basis,
         t.cost_per_1k_lines != null ? "$"+t.cost_per_1k_lines.toFixed(2) : "—",
         t.cost_per_pr != null ? "$"+t.cost_per_pr.toFixed(2) : "—",
-        t.amortized_per_1k_lines != null ? "$"+t.amortized_per_1k_lines.toFixed(2) : "—",
-        t.wall_h_per_pr_median ?? "—", t.active_h_per_pr_median ?? "—"])) +
+        t.amortized_per_1k_lines != null ? "$"+t.amortized_per_1k_lines.toFixed(2) : "—"])) +
+      (dl.length ? "" : `<div class="muted">no provider usage in this window/device</div>`)
       `<div class="muted">rates: deepseek blended $${v.rates?.deepseek_blended_usd_per_M ?? "?"}/M [estimate, off-peak applied] ·
        glm $${v.rates?.glm_amortized_usd_per_M ?? "set invoice"}/M amortized [ALLOCATION of your $${v.rates?.glm_invoice_on_file ?? "?"} invoice — marginal cash is $0 while windows are open; the real price is exhaustion risk, see Quota] ·
        shared multi-provider PRs: ${v.shared_multi_provider_prs?.count ?? 0} (credit split by token share)</div>`;

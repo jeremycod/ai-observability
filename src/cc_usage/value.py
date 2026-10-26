@@ -34,13 +34,20 @@ def _blended_rates(db, device=None):
         "cache_creation_tokens cc, record_ts ts FROM v_model_responses" + df, dp).fetchall()
     est_rows = [(r["provider"], r["model"], r["i"] or 0, r["o"] or 0, r["cr"] or 0,
                  r["cc"] or 0, ts_epoch(r["ts"])) for r in rows]
-    est, _, _ = cost.estimate_provider_usd(db, est_rows)
-    by_provider = {}
-    for r in est_rows:
-        if r[0] not in cost.PLAN_PROVIDERS:
-            by_provider[r[0]] = by_provider.get(r[0], 0) + (r[2] + r[3] + r[4] + r[5])
-    rates = {p: (est / toks * 1e6) if toks else None for p, toks in by_provider.items()}
-    return rates, est
+    # PER-PROVIDER rate: total-est / provider-tokens would contaminate every
+    # provider's rate with every other provider's expensive tokens (live bug:
+    # deepseek blended rate read 0.209/M instead of 0.0056/M because anthropic's
+    # estimate leaked into the numerator)
+    providers = {r[0] for r in est_rows if r[0] not in cost.PLAN_PROVIDERS}
+    rates = {}
+    est_by = {}
+    for p in providers:
+        prows = [r for r in est_rows if r[0] == p]
+        est_p, _, _ = cost.estimate_provider_usd(db, prows)
+        toks_p = sum(r[2] + r[3] + r[4] + r[5] for r in prows)
+        rates[p] = (est_p / toks_p * 1e6) if toks_p else None
+        est_by[p] = est_p
+    return rates, sum(est_by.values())
 
 
 def _invoice_rate(db, days):
@@ -75,11 +82,19 @@ def value_report(db, days=30, device=None):
         "basis": "deepseek = estimated (approximate prices, off-peak applied); "
                  "glm = ALLOCATION of your invoice, never marginal cost"}}
 
-    # ---- per-provider deliverable efficiency over solo merged PRs ----
+    # ---- per-provider deliverable efficiency ----
+    # EVERY provider with window usage gets a row (claude/openrouter included even when
+    # all their PR work landed on shared PRs). Lines on shared PRs are attributed
+    # fractionally by token share (weights displayed) — PR COUNT is never split.
     prs = db.execute(
         "SELECT number, merged, net_add, net_del, created_at, merged_at, ticket_keys "
         "FROM pull_requests WHERE created_at >= " + since +
         " AND ticket_keys != '[]'").fetchall()
+    window_providers = {r["provider"] for r in db.execute(
+        "SELECT DISTINCT provider FROM api_requests WHERE source='transcript' "
+        "AND record_ts >= " + since + " AND provider IS NOT NULL"
+        + df.replace("device_id", "api_requests.device_id"), dp).fetchall()
+        if r["provider"] not in ("unknown",)}
     prov_stats = {}
     shared_prs = []
     for pr in prs:
@@ -87,33 +102,43 @@ def value_report(db, days=30, device=None):
             "SELECT provider, SUM(tokens) tok, MIN(first_ts) f, MAX(last_ts) l "
             "FROM pr_contributions WHERE pr_number=?" + df + " GROUP BY provider",
             [pr["number"]] + dp).fetchall()
-        provs = {c["provider"] for c in contrib if c["provider"] not in ("unknown", None)}
-        if len(provs) > 1:
-            shares = {c["provider"]: (c["tok"] or 0) for c in contrib}
-            tot = sum(shares.values()) or 1
-            shared_prs.append({"pr": pr["number"],
-                               "share": {p: round(100.0 * t / tot, 1) for p, t in shares.items()}})
+        contrib = [c for c in contrib if c["provider"] not in ("unknown", None)
+                   and (c["tok"] or 0) > 0]
+        if not contrib:
             continue
-        if not provs:
-            continue
-        p = next(iter(provs))
-        if not pr["merged"]:
-            continue
-        s = prov_stats.setdefault(p, {"prs": 0, "tokens": 0, "net_lines": 0,
-                                      "wall_hours": [], "active_hours": []})
-        s["prs"] += 1
-        s["tokens"] += next(c["tok"] for c in contrib if c["provider"] == p)
-        s["net_lines"] += (pr["net_add"] or 0) + (pr["net_del"] or 0)
-        if pr["merged_at"] and pr["created_at"]:
+        pr_lines = (pr["net_add"] or 0) + (pr["net_del"] or 0)
+        tot = sum((c["tok"] or 0) for c in contrib) or 1
+        provs = {c["provider"] for c in contrib}
+        merged = bool(pr["merged"])
+        if merged and pr["merged_at"] and pr["created_at"]:
             h = (ts_epoch(pr["merged_at"]) - ts_epoch(pr["created_at"])) / 3600.0
-            if 0 < h < 24 * 30:  # sanity
+        else:
+            h = None
+        for c in contrib:
+            p = c["provider"]
+            s = prov_stats.setdefault(p, {
+                "solo_prs": 0, "shared_prs": 0, "tokens": 0, "net_lines": 0.0,
+                "wall_hours": [], "active_hours": []})
+            s["tokens"] += c["tok"] or 0
+            share = (c["tok"] or 0) / tot
+            if len(provs) > 1:
+                s["shared_prs"] += 1
+                if merged:
+                    s["net_lines"] += pr_lines * share  # fractional by token share
+            else:
+                if merged:
+                    s["solo_prs"] += 1
+                    s["net_lines"] += pr_lines
+                    if h is not None and 0 < h < 24 * 30:
+                        s["wall_hours"].append(round(h, 2))
+                elif h is not None and 0 < h < 24 * 30:
+                    pass
+            if c["f"] and c["l"]:
+                fh, lh = ts_epoch(c["f"]), ts_epoch(c["l"])
+                if lh > fh and (lh - fh) / 3600.0 < 24 * 30:
+                    s["active_hours"].append(round((lh - fh) / 3600.0, 2))
+            if merged and h is not None and 0 < h < 24 * 30 and len(provs) > 1:
                 s["wall_hours"].append(round(h, 2))
-        c_all = [c for c in contrib]
-        if c_all:
-            f = min((ts_epoch(c["f"]) for c in c_all if c["f"]), default=None)
-            l = max((ts_epoch(c["l"]) for c in c_all if c["l"]), default=None)
-            if f and l and l > f:
-                s["active_hours"].append(round((l - f) / 3600.0, 2))
 
     def _avg(xs):
         xs = sorted(xs)
@@ -121,22 +146,35 @@ def value_report(db, days=30, device=None):
 
     table = []
     glm_list_usd, glm_list_rate, _mix = cost.glm_list_equivalent(db, days, device)
-    for p, s in prov_stats.items():
+    # rows for EVERY provider with window usage (claude/openrouter included), sorted
+    # by tokens; providers without merged-PR credit still show burn + shared counts
+    ordered = sorted(prov_stats.items(), key=lambda kv: -kv[1]["tokens"])
+    for p in window_providers:
+        if p not in prov_stats:
+            ordered.append((p, {"solo_prs": 0, "shared_prs": 0, "tokens": 0,
+                                "net_lines": 0.0, "wall_hours": [], "active_hours": []}))
+    for p, s in ordered:
         klines = s["net_lines"] / 1000.0
         list_rate = glm_list_rate if p in cost.PLAN_PROVIDERS else rates.get(p)
         list_basis = ("API list-rate equivalent [estimate]" if p in cost.PLAN_PROVIDERS
                       else "estimated API")
         cost_per_1k = (s["tokens"] / 1e6 * list_rate / klines) if (list_rate and klines) else None
-        cost_per_pr = (s["tokens"] / 1e6 * list_rate / s["prs"]) if (list_rate and s["prs"]) else None
+        pr_count = s["solo_prs"] + s["shared_prs"]
+        cost_per_pr = (s["tokens"] / 1e6 * list_rate / pr_count) if (list_rate and pr_count) else None
         tok_per_1k = (s["tokens"] / klines) if klines else None
+        tok_per_pr = (s["tokens"] / pr_count) if pr_count else None
         amort_per_1k = amort_per_pr = None
         if p in cost.PLAN_PROVIDERS and glm_rate:
             amort_per_1k = round(s["tokens"] / 1e6 * glm_rate / klines, 2) if klines else None
-            amort_per_pr = round(s["tokens"] / 1e6 * glm_rate / s["prs"], 2) if s["prs"] else None
+            amort_per_pr = round(s["tokens"] / 1e6 * glm_rate / pr_count, 2) if pr_count else None
         table.append({
-            "provider": p, "merged_prs": s["prs"], "tokens": s["tokens"],
-            "net_lines": s["net_lines"],
+            "provider": p,
+            "solo_merged_prs": s["solo_prs"], "shared_prs": s["shared_prs"],
+            "merged_prs": s["solo_prs"],
+            "tokens": s["tokens"],
+            "net_lines": round(s["net_lines"]),
             "tokens_per_1k_lines": round(tok_per_1k) if tok_per_1k else None,
+            "tokens_per_pr": round(tok_per_pr) if tok_per_pr else None,
             "cost_basis": list_basis,
             "cost_per_1k_lines": round(cost_per_1k, 2) if cost_per_1k is not None else None,
             "cost_per_pr": round(cost_per_pr, 2) if cost_per_pr is not None else None,
@@ -144,7 +182,8 @@ def value_report(db, days=30, device=None):
             "amortized_per_pr": amort_per_pr,
             "wall_h_per_pr_median": _avg(s["wall_hours"]),
             "active_h_per_pr_median": _avg(s["active_hours"]),
-            "basis": "solo merged PRs only (%d); lines exclude generated files" % s["prs"],
+            "basis": "lines exclude generated files; on shared PRs lines are attributed "
+                     "fractionally by token share and PR count is NOT split",
         })
     out["deliverables"] = table
     out["glm_list_equivalent"] = {"usd_30d_window": round(glm_list_usd, 2),
@@ -189,19 +228,18 @@ def print_report(db, days=30):
         if n is None:
             return "—"
         return ("%.1fM" % (n / 1e6)) if n >= 1e6 else (("%.1fK" % (n / 1e3)) if n >= 1e3 else str(int(n)))
-    print("A. Tokens & cost per 1,000 delivered lines (solo merged PRs)")
+    print("A. Tokens & cost per 1,000 delivered lines (every provider with usage)")
     print("   (tokens = input + cache-read + output; on GLM cache-read is quota, on DS it is ~$0.003/M)")
-    print("%-10s %5s %10s %9s %9s %30s %10s %9s %16s" % (
-        "provider", "PRs", "tokens", "net lines", "tok/1kL", "cost basis",
-        "$/1kL", "$/PR", "$/1kL amortized"))
+    print("%-12s %4s %4s %10s %9s %10s %10s %30s %10s %9s" % (
+        "provider", "solo", "shar", "tokens", "net lines", "tok/1kL", "tok/PR",
+        "cost basis", "$/1kL", "$/PR"))
     for t in v["deliverables"]:
-        print("%-10s %5d %10s %9d %9s %30s %10s %9s %16s" % (
-            t["provider"], t["merged_prs"], "%.1fM" % (t["tokens"] / 1e6),
-            t["net_lines"], _hm(t["tokens_per_1k_lines"]), t["cost_basis"],
+        print("%-12s %4d %4d %10s %9d %10s %10s %30s %10s %9s" % (
+            t["provider"], t["solo_merged_prs"], t["shared_prs"],
+            "%.1fM" % (t["tokens"] / 1e6), t["net_lines"],
+            _hm(t["tokens_per_1k_lines"]), _hm(t["tokens_per_pr"]), t["cost_basis"],
             ("$%.2f" % t["cost_per_1k_lines"]) if t["cost_per_1k_lines"] is not None else "—",
-            ("$%.2f" % t["cost_per_pr"]) if t["cost_per_pr"] is not None else "—",
-            ("$%.2f" % t["amortized_per_1k_lines"]) if t.get("amortized_per_1k_lines")
-            is not None else "—"))
+            ("$%.2f" % t["cost_per_pr"]) if t["cost_per_pr"] is not None else "—"))
     gle = v.get("glm_list_equivalent") or {}
     if gle.get("usd_30d_window") is not None:
         print("   GLM list-rate equivalent: $%.2f for the window's GLM tokens (blended "
@@ -224,9 +262,10 @@ def print_report(db, days=30):
     print()
     print("B. Speed — PR wall-clock (created->merged, gh truth) and active-session time")
     for t in v["deliverables"]:
-        print("   %-10s median wall %sh / PR · median active %sh / PR" % (
-            t["provider"], t["wall_h_per_pr_median"] or "—",
-            t["active_h_per_pr_median"] or "—"))
+        if t["wall_h_per_pr_median"] or t["active_h_per_pr_median"]:
+            print("   %-10s median wall %sh / PR · median active %sh / PR" % (
+                t["provider"], t["wall_h_per_pr_median"] or "—",
+                t["active_h_per_pr_median"] or "—"))
     print()
     print("C. Burn per ACTION (one run of each command)")
     print("%-26s %6s %8s %12s %12s" % ("command", "runs", "responses", "tokens",
