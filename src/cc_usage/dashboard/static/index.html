@@ -66,6 +66,14 @@
   <button onclick="drill()">drill</button>
 </header>
 <main>
+  <h2 style="margin-top:4px">VALUE — tokens, dollars and speed per deliverable
+     <span class="tag">your §0 questions</span></h2>
+  <div id="value"></div>
+
+  <h2>Burn per ACTION — one run of each command
+     <span class="tag">spans close at next command or 4h idle</span></h2>
+  <div id="actions"></div>
+
   <div class="cards" id="cards"></div>
 
   <h2>Attribution coverage <span class="tag">provenance eras §12</span></h2>
@@ -186,6 +194,24 @@ async function load() {
     $("lat").innerHTML = lat.length ? barchart(lat.map(l=>({label:l.day,
       parts:[{name:l.model+" avg", v:l.avg_ms, color:"#f59e0b"}]}))) :
       `<div class="muted">no measured rows yet in window (basis: ${tr.basis})</div>`;
+
+    const v = await api("value", days);
+    const dl = v.deliverables || [];
+    $("value").innerHTML = table(
+      ["provider","merged PRs","tokens","net lines","tokens/1kL","cost basis","$/1kL","$/PR","wall h/PR (med)","active h/PR (med)"],
+      dl.map(t => [t.provider, t.merged_prs, fmt(t.tokens), fmt(t.net_lines),
+        t.tokens_per_1k_lines || "—", t.cost_basis,
+        t.cost_per_1k_lines != null ? "$"+t.cost_per_1k_lines.toFixed(2) : "—",
+        t.cost_per_pr != null ? "$"+t.cost_per_pr.toFixed(2) : "—",
+        t.wall_h_per_pr_median ?? "—", t.active_h_per_pr_median ?? "—"])) +
+      `<div class="muted">rates: deepseek blended $${v.rates?.deepseek_blended_usd_per_M ?? "?"}/M [estimate, off-peak applied] ·
+       glm $${v.rates?.glm_amortized_usd_per_M ?? "set invoice"}/M [ALLOCATION of your $${v.rates?.glm_invoice_on_file ?? "?"} invoice — marginal cash is $0 while windows are open; the real price is exhaustion risk, see Quota] ·
+       shared multi-provider PRs: ${v.shared_multi_provider_prs?.count ?? 0} (credit split by token share)</div>`;
+    $("actions").innerHTML = table(
+      ["command","runs","responses","tokens","tokens per run"],
+      (v.actions||[]).map(a => [a.command, a.runs, a.responses, fmt(a.tokens),
+        a.tokens_per_run ? fmt(a.tokens_per_run) : "—"])) +
+      `<div class="muted">${v.actions_caption||""}</div>`;
 
     const c = await api("concurrency", days);
     $("conc").innerHTML = Object.entries(c.buckets).map(([k,v]) =>

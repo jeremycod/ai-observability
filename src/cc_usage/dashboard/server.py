@@ -55,6 +55,9 @@ def make_handler(db_path):
                             data = queries.quota(db)
                         elif u.path == "/api/prs":
                             data = queries.prs(db, days)
+                        elif u.path == "/api/value":
+                            from .. import value
+                            data = value.value_report(db, days)
                         else:
                             return self._send(404, b'{"error":"unknown endpoint"}',
                                               "application/json")

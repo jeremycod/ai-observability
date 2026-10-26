@@ -94,6 +94,8 @@ def build_parser():
     cst.add_argument("--days", type=int, default=30)
     cmp_ = sp.add_parser("compare", help="provider comparison methodology (§13)")
     cmp_.add_argument("--days", type=int, default=90)
+    val = sp.add_parser("value", help="tokens/$/speed per 1k lines and per action (§0 goals)")
+    val.add_argument("--days", type=int, default=30)
     vld = sp.add_parser("validate", help="reconcile validation datasets #1-#5 (§14)")
     dash = sp.add_parser("dashboard", help="local web dashboard on 127.0.0.1 (read-only)")
     dash.add_argument("--port", type=int, default=4399)
@@ -334,6 +336,13 @@ def main(argv=None):
         db = connect(DB_PATH, timeout=60)
         migrate(db)
         code = validate.validate(db)
+        db.close()
+        return code
+    if cmd == "value":
+        from . import value
+        db = connect(DB_PATH, timeout=30)
+        migrate(db)
+        code = value.print_report(db, days=args.days)
         db.close()
         return code
     if cmd == "dashboard":
