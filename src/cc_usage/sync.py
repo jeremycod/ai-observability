@@ -157,13 +157,17 @@ def _apply_line(db, line, applied):
 
 
 def make_receiver_handler(db_path, token):
+    """token=None/empty -> OPEN mode: meant for a Tailscale/private network where
+    WireGuard provides encryption + device identity. A configured token enforces
+    bearer auth (use it if the receiver is ever reachable beyond your tailnet)."""
     class Receiver(BaseHTTPRequestHandler):
         def do_POST(self):
             if self.path != "/sync":
                 return self._send(404, b'{"error":"not found"}')
-            auth = self.headers.get("Authorization", "")
-            if not token or auth != "Bearer " + token:
-                return self._send(403, b'{"error":"forbidden"}')
+            if token:
+                auth = self.headers.get("Authorization", "")
+                if auth != "Bearer " + token:
+                    return self._send(403, b'{"error":"forbidden"}')
             n = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(n)
             db = connect(db_path)
@@ -206,7 +210,8 @@ def serve_sync(port=4398, db_path=None, token=None):
                   Path.home() / ".local/share/cc-usage/aggregate.db")
     server = ThreadingHTTPServer(("0.0.0.0", port), make_receiver_handler(db_path, token))
     server.daemon_threads = True
-    print("cc-usage sync receiver on :%d -> %s" % (port, db_path), flush=True)
+    mode = "token-authed" if token else "OPEN (no token — protect via Tailscale/private net)"
+    print("cc-usage sync receiver on :%d -> %s [%s]" % (port, db_path, mode), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

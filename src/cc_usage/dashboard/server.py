@@ -90,12 +90,14 @@ def make_handler(db_path):
     return Handler
 
 
-def run(port=4399, db_path=None, open_browser=False):
+def run(port=4399, db_path=None, open_browser=False, host="127.0.0.1"):
+    """host defaults to loopback; bind a Tailscale IP/name to view the AGGREGATE
+    dashboard from other devices (read-only server, still no auth — tailnet only)."""
     from ..config import DB_PATH as DEFAULT_DB
     db_path = str(db_path or DEFAULT_DB)
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(db_path))
+    server = ThreadingHTTPServer((host, port), make_handler(db_path))
     server.daemon_threads = True
-    url = "http://127.0.0.1:%d" % port
+    url = "http://%s:%d" % (host, port)
     print("cc-usage observatory: %s  (read-only; Ctrl-C to stop)" % url)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

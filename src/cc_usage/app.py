@@ -104,13 +104,16 @@ def build_parser():
     ss = sp.add_parser("serve-sync", help="run the aggregation receiver (staging server)")
     ss.add_argument("--port", type=int, default=4398)
     ss.add_argument("--db", default=None)
-    ss.add_argument("--token", default=None)
+    ss.add_argument("--token", default=None, help="optional; omit for Tailscale/open mode")
     dv = sp.add_parser("device", help="show this machine's device id (and backfill)")
     vld = sp.add_parser("validate", help="reconcile validation datasets #1-#5 (§14)")
     dash = sp.add_parser("dashboard", help="local web dashboard on 127.0.0.1 (read-only)")
     dash.add_argument("--port", type=int, default=4399)
     dash.add_argument("--db", default=None)
     dash.add_argument("--open", action="store_true", help="open the browser")
+    dash.add_argument("--host", default="127.0.0.1",
+                      help="bind address; set to your Tailscale IP to view the "
+                           "AGGREGATE from other devices (read-only)")
     costp = sp.add_parser("config", help="settings (set/show)")
     costp.add_argument("action", choices=["set", "show"])
     costp.add_argument("key", nargs="?", default=None)
@@ -376,9 +379,9 @@ def main(argv=None):
                 print("never pushed")
             db.close()
             return 0
-        token = os.environ.get(args.token_env, "")
-        if not args.url or not token:
-            print("set CC_USAGE_SYNC_URL and %s (or --url)" % args.token_env)
+        token = os.environ.get(args.token_env, "") if args.token_env else ""
+        if not args.url:
+            print("set CC_USAGE_SYNC_URL (or --url); token optional in tailnet open mode")
             db.close()
             return 1
         sent, applied = _sync.push(db, args.url, token)
@@ -398,7 +401,8 @@ def main(argv=None):
         return 0
     if cmd == "dashboard":
         from .dashboard import server
-        return server.run(port=args.port, db_path=args.db, open_browser=args.open)
+        return server.run(port=args.port, db_path=args.db, open_browser=args.open,
+                          host=getattr(args, "host", "127.0.0.1"))
     if cmd == "spool":
         from .collector import spool_prune
         return spool_prune()

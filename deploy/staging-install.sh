@@ -2,14 +2,13 @@
 # Staging receiver install (run ON the staging server, e.g. 10.0.0.207).
 # Requires: python3, a token. Installs a systemd service listening on :4398.
 #   sudo CC_USAGE_SYNC_TOKEN='<generate-one>' ./deploy/staging-install.sh
-# The token must match CC_USAGE_SYNC_TOKEN on every laptop. LAN-only exposure is
-# expected (both laptops are on the same network); do not port-forward to the internet.
+# Intended to be reached over Tailscale (open mode, no token): only tailnet devices
+# can connect. Set CC_USAGE_SYNC_TOKEN to enable bearer auth if it will ever be
+# reachable beyond your tailnet.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DEST=/opt/cc-usage
-TOKEN="${CC_USAGE_SYNC_TOKEN:-}"
-[ -n "$TOKEN" ] || { echo "set CC_USAGE_SYNC_TOKEN first (openssl rand -hex 32)"; exit 1; }
 
 mkdir -p "$DEST"
 rm -rf "$DEST/cc_usage"
@@ -24,12 +23,17 @@ After=network.target
 
 [Service]
 ExecStart=/usr/bin/python3 $DEST/cc_usage.py serve-sync --port 4398 --db /var/lib/cc-usage/aggregate.db
-Environment=CC_USAGE_SYNC_TOKEN=$TOKEN
 Restart=always
 User=$USER
 [Install]
 WantedBy=multi-user.target
 EOF
+if [ -n "$TOKEN" ]; then
+  mkdir -p /etc/systemd/system/cc-usage-sync.service.d
+  printf '[Service]
+Environment=CC_USAGE_SYNC_TOKEN=%s
+' "$TOKEN" > /etc/systemd/system/cc-usage-sync.service.d/token.conf
+fi
 
 systemctl daemon-reload
 systemctl enable --now cc-usage-sync

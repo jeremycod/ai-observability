@@ -114,6 +114,40 @@ class TestSync(Base):
             agg2.close()
             aggconn = sqlite3.connect(str(agg_db))
             aggconn.row_factory = sqlite3.Row
+            # OPEN mode (no token) accepts pushes — the Tailscale deployment shape
+            port2 = free_port()
+            open_db = str(agg_home / "open.db")
+            errf2 = tempfile.TemporaryFile()
+            pro2 = subprocess.Popen(
+                [sys.executable, "-c",
+                 "from cc_usage.sync import serve_sync; serve_sync(port=%d, db_path=%r)"
+                 % (port2, open_db)],
+                env=dict({k: v for k, v in os.environ.items()
+                          if k != "CC_USAGE_SYNC_TOKEN"}, PYTHONPATH=SRC),
+                stdout=subprocess.DEVNULL, stderr=errf2,
+                start_new_session=True)
+            try:
+                up2 = False
+                for _ in range(300):
+                    try:
+                        with socket.create_connection(("127.0.0.1", port2), timeout=0.2):
+                            up2 = True
+                            break
+                    except OSError:
+                        time.sleep(0.1)
+                        if pro2.poll() is not None:
+                            break
+                if not up2:
+                    errf2.seek(0)
+                    self.fail("open receiver did not start: %r" % errf2.read()[:400])
+                sent2, _ = sync.push(db, "http://127.0.0.1:%d" % port2, "", device="dev-A")
+                self.assertGreater(sent2, 0, "open-mode receiver must accept tokenless push")
+            finally:
+                pro2.terminate()
+                try:
+                    pro2.wait(5)
+                except subprocess.TimeoutExpired:
+                    pro2.kill()
             self.assertEqual(len(queries.devices(aggconn)), 2)
             # sessR rows carry the CAPTURING machine id (set at ingest), sessW is dev-B
             from cc_usage.ingest.transcripts import DEVICE as MACHINE

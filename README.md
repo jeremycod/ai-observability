@@ -80,22 +80,33 @@ idempotent to a receiver on your staging server. Every row is tagged with a stab
 `device_id`, so the dashboard and CLI can filter **personal laptop / work laptop /
 everything**.
 
+Transport: **Tailscale** (works from any network; WireGuard provides encryption and
+device identity). On a private tailnet the receiver runs in **open mode — no token
+needed**; set `CC_USAGE_SYNC_TOKEN` only if the receiver is ever reachable beyond your
+tailnet.
+
 One-time setup:
 ```bash
-# staging server (10.0.0.207):
-openssl rand -hex 32                      # generate a token
-sudo CC_USAGE_SYNC_TOKEN='<token>' ./deploy/staging-install.sh
+# staging server: install Tailscale, then:
+sudo ./deploy/staging-install.sh                    # token omitted -> open mode
+tailscale ip -4                                     # note the 100.x.y.z address
 
 # each laptop:
-security add-generic-password -a "$USER" -s cc-usage-sync-token -w   # paste token
-export CC_USAGE_SYNC_URL=http://10.0.0.207:4398      # e.g. in ~/.zshrc
-cc-usage device                                      # shows this machine's device id
-cc-usage sync push                                   # initial full push (then incremental)
+export CC_USAGE_SYNC_URL=http://<staging-tailscale-ip-or-magicdns>:4398   # e.g. ~/.zshrc
+cc-usage device                                     # shows this machine's device id
+cc-usage sync push                                  # initial full push (then incremental)
+```
+
+View the aggregate from any tailnet device:
+```bash
+ssh staging 'python3 /opt/cc-usage/cc_usage.py dashboard \
+    --db /var/lib/cc-usage/aggregate.db --port 4399 --host $(tailscale ip -4)'
+# then open http://<staging-tailscale-ip>:4399 and pick the device selector
 ```
 
 Ongoing: `cc-usage sync push` whenever you like (watermarks make it incremental), or
-set `CC_USAGE_SYNC_URL` + `CC_USAGE_SYNC_TOKEN` in the environment and the collector
-auto-pushes after every sweep. Point the dashboard at the aggregate:
+set `CC_USAGE_SYNC_URL` in the environment and the collector auto-pushes after every
+sweep (token unnecessary in tailnet open mode). Point the dashboard at the aggregate:
 `cc-usage dashboard --db /var/lib/cc-usage/aggregate.db` (on staging) and pick the
 device in the header selector — `everything` merges both laptops; the shared-bucket
 and matched-set rules already handle PRs touched from both.
