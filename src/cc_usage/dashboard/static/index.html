@@ -216,7 +216,7 @@ async function load() {
         t.cost_per_1k_lines != null ? "$"+t.cost_per_1k_lines.toFixed(2) : "—",
         t.cost_per_pr != null ? "$"+t.cost_per_pr.toFixed(2) : "—",
         t.amortized_per_1k_lines != null ? "$"+t.amortized_per_1k_lines.toFixed(2) : "—"])) +
-      (dl.length ? "" : `<div class="muted">no provider usage in this window/device</div>`)
+      (dl.length ? "" : `<div class="muted">no provider usage in this window/device</div>`) +
       `<div class="muted">rates: deepseek blended $${v.rates?.deepseek_blended_usd_per_M ?? "?"}/M [estimate, off-peak applied] ·
        glm $${v.rates?.glm_amortized_usd_per_M ?? "set invoice"}/M amortized [ALLOCATION of your $${v.rates?.glm_invoice_on_file ?? "?"} invoice — marginal cash is $0 while windows are open; the real price is exhaustion risk, see Quota] ·
        shared multi-provider PRs: ${v.shared_multi_provider_prs?.count ?? 0} (credit split by token share)</div>`;
@@ -251,7 +251,9 @@ async function load() {
         `${e.code||e.kind} @ ${e.ts.slice(0,16)}`).join(" · ") + `</div>` : "") +
       `<div class="muted">${q.caption}</div>`;
   } catch (e) {
-    $("cards").innerHTML = card("error", "", e.message);
+    $("cards").innerHTML = card("error", "", e.message) +
+      '<div class="cov"><pre class="muted" style="white-space:pre-wrap">' +
+      (e.stack || e.message) + "</pre></div>";
   }
 }
 async function drill() {
