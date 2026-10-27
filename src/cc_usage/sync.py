@@ -141,10 +141,17 @@ def _iter_batches(db, device):
                                          "kept": kept}}) + "\n"
 
 
-def push(db, url, token, device=None):
-    """Push local data to the staging aggregator. Returns (lines_sent, applied)."""
+def push(db, url, token, device=None, full=False):
+    """Push local data to the staging aggregator. Returns (lines_sent, applied).
+    full=True resets per-table watermarks first: EVERYTHING is re-sent (safe —
+    watermark tables apply with INSERT OR IGNORE, mutable tables REPLACE, phase
+    tables upsert by deterministic id). Use after the aggregate DB was rebuilt,
+    or whenever the mirror should be re-derived from local truth."""
     device = device or os.environ.get("CC_USAGE_DEVICE") or devicemod.device_id()
     ensure_device_backfill(db)
+    if full:
+        db.execute("DELETE FROM sync_state")
+        db.commit()
     body_iter = _iter_batches(db, device)
     sent = 0
     req = urllib.request.Request(

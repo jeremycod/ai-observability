@@ -106,7 +106,11 @@ ssh staging 'python3 /opt/cc-usage/cc_usage.py dashboard \
 
 Ongoing: `cc-usage sync push` whenever you like (watermarks make it incremental), or
 set `CC_USAGE_SYNC_URL` in the environment and the collector auto-pushes after every
-sweep (token unnecessary in tailnet open mode). Point the dashboard at the aggregate:
+sweep (token unnecessary in tailnet open mode).
+
+Rebuilt or wiped the aggregate DB? Each device must re-send its full history once:
+`cc-usage sync push --full` (resets watermarks; the push is idempotent, and the
+local database is never modified by syncing). Point the dashboard at the aggregate:
 `cc-usage dashboard --db /var/lib/cc-usage/aggregate.db` (on staging) and pick the
 device in the header selector — `everything` merges both laptops; the shared-bucket
 and matched-set rules already handle PRs touched from both.

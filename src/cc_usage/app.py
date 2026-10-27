@@ -101,6 +101,9 @@ def build_parser():
     sy.add_argument("action", choices=["push", "status"])
     sy.add_argument("--url", default=os.environ.get("CC_USAGE_SYNC_URL", ""))
     sy.add_argument("--token-env", default="CC_USAGE_SYNC_TOKEN")
+    sy.add_argument("--full", action="store_true",
+                    help="re-send EVERYTHING (resets watermarks); use after the "
+                         "aggregate DB was rebuilt/wiped")
     ss = sp.add_parser("serve-sync", help="run the aggregation receiver (staging server)")
     ss.add_argument("--port", type=int, default=4398)
     ss.add_argument("--db", default=None)
@@ -384,7 +387,7 @@ def main(argv=None):
             print("set CC_USAGE_SYNC_URL (or --url); token optional in tailnet open mode")
             db.close()
             return 1
-        sent, applied = _sync.push(db, args.url, token)
+        sent, applied = _sync.push(db, args.url, token, full=getattr(args, "full", False))
         print("pushed %d rows; receiver applied: %s" % (sent, applied))
         db.close()
         return 0

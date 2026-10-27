@@ -49,6 +49,9 @@ source ~/.zshrc
 cc-usage sync push        # first push = full local history; then incremental
 cc-usage sync status      # watermarks recorded
 ```
+NOTE: this laptop pushed before the 2026-10-26 aggregate rebuild and the staging
+receiver's watermarks no longer match. After updating code (git pull + reinstall),
+re-send everything once: `cc-usage sync push --full` — safe and idempotent.
 (A token is NOT needed — the receiver runs open mode on my private network.)
 
 ### Step 4 — verify aggregation (from this laptop)
