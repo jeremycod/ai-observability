@@ -151,14 +151,17 @@ async function api(name, days, device) {
   return r.json();
 }
 async function load() {
+  window.__step = "start";
   const days = +$("days").value;
   const device = $("device").value || "all";
   if ($("device").options.length <= 1) {
     try { (await api("devices")).forEach(d => {
       const o = document.createElement("option"); o.value = d; o.textContent = d;
-      $("device").appendChild(o); }); } catch (e) {}
+      $("device").appendChild(o); }); } catch (e) {
+    window.__step = "ERROR: " + (window.__step || "?") + " :: " + e.message;}
   }
   try {
+    window.__step = "summary-fetch";
     const s = await api("summary", days, device);
     $("cards").innerHTML =
       card("responses", fmt(s.responses), `${s.sessions} sessions · ${s.window_days}d window`) +
@@ -169,6 +172,7 @@ async function load() {
       `<div class="row"><div class="lbl">${k}</div><div class="track"><div class="bar" style="width:${v}%"></div></div><div>${v}%</div></div>`).join("") +
       `<div class="muted">${s.basis}</div>`;
 
+    window.__step = "provs-fetch";
     const provs = await api("providers", days, device);
     $("prov").innerHTML = table(
       ["launcher/bucket","provider","responses","tokens","merged","avg rounds","basis"],
@@ -178,6 +182,7 @@ async function load() {
         [p.launcher, `<span class="pill ${p.provider}">${p.provider}</span>`, p.responses,
          fmt(p.tokens), "—", "—", `<span class="tag">${p.basis}</span>`]));
 
+    window.__step = "phases-fetch";
     const ph = await api("phases", days, device);
     const byPhase = {};
     ph.forEach(r => byPhase[r.phase] = (byPhase[r.phase]||0) + r.tokens);
@@ -193,6 +198,7 @@ async function load() {
       table(["ticket","phase","responses","tokens"],
         ph.slice(0,10).map(r=>[r.ticket, r.phase, r.responses, fmt(r.tokens)]));
 
+    window.__step = "trends-fetch";
     const tr = await api("trends", days, device);
     const byDay = {};
     tr.daily_tokens.forEach(r => {
@@ -206,6 +212,7 @@ async function load() {
       parts:[{name:l.model+" avg", v:l.avg_ms, color:"#f59e0b"}]}))) :
       `<div class="muted">no measured rows yet in window (basis: ${tr.basis})</div>`;
 
+    window.__step = "value-fetch";
     const v = await api("value", days, device);
     const dl = v.deliverables || [];
     $("value").innerHTML = table(
@@ -227,6 +234,7 @@ async function load() {
         a.tokens_per_run ? fmt(a.tokens_per_run) : "—"])) +
       `<div class="muted">${v.actions_caption||""}</div>`;
 
+    window.__step = "conc-fetch";
     const c = await api("concurrency", days, device);
     $("conc").innerHTML = Object.entries(c.buckets).map(([k,v]) =>
       `<div class="row" style="display:flex;gap:10px;align-items:center;margin:5px 0">
@@ -237,6 +245,7 @@ async function load() {
       `<div class="muted">${c.basis}</div>`;
 
     const prs = await api("prs", days, device);
+    window.__step = "prs-render";
     $("prs").innerHTML = table(["PR","tickets","state","bucket","rounds","net +","net −"],
       prs.slice(0,15).map(p=>[
         `#${p.number}`, (JSON.parse(p.ticket_keys||"[]")||[]).join(", "),
@@ -252,6 +261,7 @@ async function load() {
         `${e.code||e.kind} @ ${e.ts.slice(0,16)}`).join(" · ") + `</div>` : "") +
       `<div class="muted">${q.caption}</div>`;
   } catch (e) {
+    window.__step = "ERROR: " + (window.__step || "?") + " :: " + e.message;
     $("cards").innerHTML = card("error", "", e.message) +
       '<div class="cov"><pre class="muted" style="white-space:pre-wrap">' +
       (e.stack || e.message) + "</pre></div>";
