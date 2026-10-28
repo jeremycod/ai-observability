@@ -18,10 +18,12 @@ Measurement contracts:
   (labeled approximate, off-peak applied).
 """
 import datetime as dt
+import json
 
 from . import cost
 from .correlate.github import outcomes
-from .ingest.transcripts import ts_epoch
+from .ingest.transcripts import SUBAGENT_RE, ts_epoch
+from .correlate.github import TICKET_RE
 
 
 def _blended_rates(db, device=None):
@@ -159,10 +161,13 @@ def value_report(db, days=30, device=None):
     # zero PR credit), sorted by window tokens. tokens = ALL window usage for the
     # provider (work + overhead incl. non-ticket analysis), NOT just PR-linked work.
     for p in window_tokens:
+        if p == "unknown":
+            continue  # unattributed rows stay in the providers panel, not VALUE
         if p not in prov_stats:
             prov_stats[p] = {"solo_prs": 0, "shared_prs": 0, "tokens": 0,
                              "net_lines": 0.0, "wall_hours": [], "active_hours": []}
     ordered = sorted(prov_stats.items(), key=lambda kv: -window_tokens.get(kv[0], 0))
+    ordered = [(p, s) for p, s in ordered if p != "unknown"]
     for p, s in ordered:
         klines = s["net_lines"] / 1000.0
         list_rate = glm_list_rate if p in cost.PLAN_PROVIDERS else rates.get(p)
@@ -202,6 +207,54 @@ def value_report(db, days=30, device=None):
                      "non-PR work — context only, never divided by PR lines",
         })
     out["deliverables"] = table
+
+    # ---- in-flight work: window tokens on tickets WITHOUT a merged PR ----
+    # (OpenRouter's zero-credit explanation: its tickets 6257/6230/6261/6265 are
+    # still open — the burn is real, the delivery hasn't happened yet.)
+    merged_tickets = set()
+    for r in db.execute("SELECT ticket_keys FROM pull_requests WHERE merged=1 AND "
+                        "ticket_keys != '[]'").fetchall():
+        try:
+            merged_tickets |= set(json.loads(r["ticket_keys"]))
+        except (ValueError, TypeError):
+            pass
+    in_flight = {}
+    for sess in db.execute(
+            "SELECT s.git_branch b, COALESCE(s.launcher,'?') launcher, "
+            "SUM(r.input_tokens+r.output_tokens+r.cache_read_tokens+r.cache_creation_tokens) tok, "
+            "COUNT(r.id) n FROM sessions s JOIN api_requests r ON r.session_id=s.session_id "
+            "WHERE r.source='transcript' AND r.record_ts >= " + since +
+            " AND s.git_branch LIKE 'jeremycod/RUS-%' GROUP BY s.session_id, s.git_branch, s.launcher").fetchall():
+        m = TICKET_RE.search((sess["b"] or "").upper())
+        if not m or m.group(1) in merged_tickets:
+            continue  # delivered or non-ticket branch
+        key = (sess["launcher"], m.group(1))
+        agg = in_flight.setdefault(key, {"tokens": 0, "responses": 0})
+        agg["tokens"] += sess["tok"] or 0
+        agg["responses"] += sess["n"]
+    out["in_flight"] = [
+        {"launcher": k[0], "ticket": k[1], "tokens": v["tokens"],
+         "responses": v["responses"],
+         "note": "work started on this ticket but its PR is not merged — no "
+                 "delivered-line credit yet"} for k, v in
+        sorted(in_flight.items(), key=lambda kv: -kv[1]["tokens"])[:12]]
+
+    # ---- plan what-if: deliver the same merged-PR lines on each provider ----
+    total_lines = sum(t["net_lines"] for t in table)
+    what_if = []
+    for t in table:
+        rate = t["cost_per_1k_lines"]
+        if rate is None:
+            continue
+        what_if.append({"provider": t["provider"], "usd_for_same_lines": round(
+            rate * total_lines / 1000.0, 2)})
+    out["plan_what_if"] = {
+        "merged_lines_30d": round(total_lines),
+        "scenarios": what_if,
+        "note": "SAME delivered lines priced at each provider's measured $/1kL "
+                "(zai = amortized plan allocation + its list-equiv; cross-model "
+                "token-count differences not adjusted)"}
+
     out["glm_list_equivalent"] = {"usd_30d_window": round(glm_list_usd, 2),
                                   "rate_per_M": round(glm_list_rate, 4) if glm_list_rate else None,
                                   "version": cost.GLM_LIST_VERSION,

@@ -96,6 +96,17 @@ def offpeak_factor(ts_epoch_val):
     return OFFPEAK["discount"] if in_window else 1.0
 
 
+def pricing_model(provider, model):
+    """Map an (openrouter-routed) model to its underlying pricing table.
+    OpenRouter pass-through: deepseek models price at DeepSeek list rates,
+    labeled 'via OpenRouter [pass-through assumed]' in reports."""
+    m = (model or "").lower()
+    if provider == "openrouter":
+        if "deepseek" in m:
+            return "deepseek", "deepseek-flash"
+    return provider, model
+
+
 def estimate_provider_usd(db, rows):
     """rows: iterable of (provider, model, input, output, cache_read, cache_creation,
     ts_epoch). Returns (estimated_usd, n_priced, n_unpriced). Z.ai rows are NEVER
@@ -108,6 +119,8 @@ def estimate_provider_usd(db, rows):
             base = p
         if base in PLAN_PROVIDERS:
             continue
+        if base == "openrouter":
+            base, model = pricing_model(base, model)
         pin_miss = price_for(db, base, model, "input_cache_miss")
         pin_hit = price_for(db, base, model, "input_cache_hit")
         pout = price_for(db, base, model, "output")

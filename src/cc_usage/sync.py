@@ -33,7 +33,7 @@ WATERMARK = ["api_requests", "api_errors", "otel_api_requests", "command_events"
              "api_request_occurrences"]
 UPSERT = ["sessions", "prompt_context", "pull_requests", "pr_reviews", "pr_revisions",
           "pr_files", "subagent_dispatches", "jira_issues", "quota_windows",
-          "critic_findings", "review_artifacts", "work_lineages"]
+          "critic_findings", "review_artifacts", "work_lineages", "settings"]
 PHASE_TABLES = ["workflow_phases", "phase_transitions"]  # deterministic per-device ids
 BATCH = 4000
 
