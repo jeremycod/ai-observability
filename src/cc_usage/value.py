@@ -168,22 +168,24 @@ def value_report(db, days=30, device=None):
         list_rate = glm_list_rate if p in cost.PLAN_PROVIDERS else rates.get(p)
         list_basis = ("API list-rate equivalent [estimate]" if p in cost.PLAN_PROVIDERS
                       else "estimated API")
+        pr_tokens = s["tokens"]  # PR-attributed contribution tokens (same scope as lines)
         wt = window_tokens.get(p, 0)
-        cost_per_1k = (wt / 1e6 * list_rate / klines) if (list_rate and klines) else None
+        cost_per_1k = (pr_tokens / 1e6 * list_rate / klines) if (list_rate and klines) else None
         pr_count = s["solo_prs"] + s["shared_prs"]
-        cost_per_pr = (wt / 1e6 * list_rate / pr_count) if (list_rate and pr_count) else None
-        tok_per_1k = (wt / klines) if klines else None
-        tok_per_pr = (wt / pr_count) if pr_count else None
+        cost_per_pr = (pr_tokens / 1e6 * list_rate / pr_count) if (list_rate and pr_count) else None
+        tok_per_1k = (pr_tokens / klines) if klines else None
+        tok_per_pr = (pr_tokens / pr_count) if pr_count else None
         amort_per_1k = amort_per_pr = None
         if p in cost.PLAN_PROVIDERS and glm_rate:
-            amort_per_1k = round(wt / 1e6 * glm_rate / klines, 2) if klines else None
-            amort_per_pr = round(wt / 1e6 * glm_rate / pr_count, 2) if pr_count else None
+            amort_per_1k = round(pr_tokens / 1e6 * glm_rate / klines, 2) if klines else None
+            amort_per_pr = round(pr_tokens / 1e6 * glm_rate / pr_count, 2) if pr_count else None
         table.append({
             "provider": p,
             "solo_merged_prs": s["solo_prs"], "shared_prs": s["shared_prs"],
             "merged_prs": s["solo_prs"],
-            "tokens": window_tokens.get(p, 0),
-            "pr_tokens": s["tokens"],
+            "tokens": pr_tokens,
+            "window_tokens": wt,
+            "window_responses": window_responses.get(p, 0),
             "net_lines": round(s["net_lines"]),
             "tokens_per_1k_lines": round(tok_per_1k) if tok_per_1k else None,
             "tokens_per_pr": round(tok_per_pr) if tok_per_pr else None,
@@ -194,10 +196,10 @@ def value_report(db, days=30, device=None):
             "amortized_per_pr": amort_per_pr,
             "wall_h_per_pr_median": _avg(s["wall_hours"]),
             "active_h_per_pr_median": _avg(s["active_hours"]),
-            "window_responses": window_responses.get(p, 0),
-            "basis": "tokens = ALL window usage for the provider (work + overhead incl. "
-                     "non-ticket analysis); lines = merged-PR attributed (generated "
-                     "files excluded; shared PRs fractionally by token share)",
+            "basis": "tokens/1kL, $/1kL, $/PR use PR-ATTRIBUTED tokens only (same scope "
+                     "as the lines: generated files excluded; shared PRs fractionally "
+                     "by token share). window_tokens = provider's total burn incl. "
+                     "non-PR work — context only, never divided by PR lines",
         })
     out["deliverables"] = table
     out["glm_list_equivalent"] = {"usd_30d_window": round(glm_list_usd, 2),
